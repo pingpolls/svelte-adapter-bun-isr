@@ -5,5 +5,4 @@ dist
 .env
 npm-debug.log*
 fixtures/build
-GENTASK.md
 PLAN.md
