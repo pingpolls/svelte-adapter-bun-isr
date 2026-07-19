@@ -1,0 +1,12 @@
+{
+	"name": "svelte-adapter-bun-isr",
+	"module": "src/index.ts",
+	"type": "module",
+	"devDependencies": {
+		"@types/bun": "latest"
+	},
+	"scripts": {
+		"build": "bun src/index.ts",
+		"test": "bun test"
+	}
+}
