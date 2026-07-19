@@ -1,4 +1,5 @@
 import { cpSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { Adapter, Builder } from "@sveltejs/kit";
 
@@ -46,24 +47,24 @@ export default function (options: AdapterOptions = {}): Adapter {
 				].join("\n\n"),
 			);
 
-			// 5. Copy manifest to dest
-			if (!existsSync(join(dest, "server"))) {
-				mkdirSync(join(dest, "server"), { recursive: true });
-			}
-			cpSync(join(tmp, "manifest.js"), join(dest, "server", "manifest.js"));
+			// 5. Copy server artifacts to dest
+			const serverDest = join(dest, "server");
+			mkdirSync(serverDest, { recursive: true });
+
+			cpSync(join(tmp, "manifest.js"), join(serverDest, "manifest.js"));
 
 			// Copy server index if it exists
 			const serverIndex = join(tmp, "index.js");
 			if (existsSync(serverIndex)) {
-				cpSync(serverIndex, join(dest, "server", "index.js"));
+				cpSync(serverIndex, join(serverDest, "index.js"));
 			}
 
-			// Copy all server chunks
+			// Copy server chunks
 			const serverChunksDir = join(tmp, "chunks");
 			if (existsSync(serverChunksDir)) {
-				const destChunksDir = join(dest, "server", "chunks");
+				const destChunksDir = join(serverDest, "chunks");
 				mkdirSync(destChunksDir, { recursive: true });
-				const chunks = require("node:fs").readdirSync(serverChunksDir);
+				const chunks = await readdir(serverChunksDir);
 				for (const chunk of chunks) {
 					cpSync(join(serverChunksDir, chunk), join(destChunksDir, chunk));
 				}
@@ -72,42 +73,32 @@ export default function (options: AdapterOptions = {}): Adapter {
 			// Copy server entries
 			const serverEntriesDir = join(tmp, "entries");
 			if (existsSync(serverEntriesDir)) {
-				copyDirRecursive(serverEntriesDir, join(dest, "server", "entries"));
+				await copyDirAsync(serverEntriesDir, join(serverDest, "entries"));
 			}
 
 			// Copy server nodes
 			const serverNodesDir = join(tmp, "nodes");
 			if (existsSync(serverNodesDir)) {
-				copyDirRecursive(serverNodesDir, join(dest, "server", "nodes"));
+				await copyDirAsync(serverNodesDir, join(serverDest, "nodes"));
 			}
 
-			// Copy server env.js
-			const envFile = join(tmp, "env.js");
-			if (existsSync(envFile)) {
-				cpSync(envFile, join(dest, "server", "env.js"));
+			// Copy single-file server artifacts
+			const singleFiles = ["env.js", "internal.js", "remote-entry.js"];
+			for (const name of singleFiles) {
+				const src = join(tmp, name);
+				if (existsSync(src)) {
+					cpSync(src, join(serverDest, name));
+				}
 			}
 
-			// Copy server internal.js
-			const internalFile = join(tmp, "internal.js");
-			if (existsSync(internalFile)) {
-				cpSync(internalFile, join(dest, "server", "internal.js"));
-			}
-
-			// Copy server remote-entry.js
-			const remoteEntry = join(tmp, "remote-entry.js");
-			if (existsSync(remoteEntry)) {
-				cpSync(remoteEntry, join(dest, "server", "remote-entry.js"));
-			}
-
-			// Copy server .vite manifest
+			// Copy .vite manifest if present
 			const viteManifest = join(tmp, ".vite");
 			if (existsSync(viteManifest)) {
-				copyDirRecursive(viteManifest, join(dest, "server", ".vite"));
+				await copyDirAsync(viteManifest, join(serverDest, ".vite"));
 			}
 
 			// 6. Write the Bun server entry point with ISR caching
-			const serverCode = generateServerCode(port);
-			writeFileSync(join(dest, "index.js"), serverCode);
+			writeFileSync(join(dest, "index.js"), generateServerCode(port));
 
 			builder.log.minor(`Adapter output written to ${dest}`);
 		},
@@ -118,14 +109,14 @@ export default function (options: AdapterOptions = {}): Adapter {
 	};
 }
 
-function copyDirRecursive(src: string, dest: string) {
+async function copyDirAsync(src: string, dest: string) {
 	mkdirSync(dest, { recursive: true });
-	const entries = require("node:fs").readdirSync(src, { withFileTypes: true });
+	const entries = await readdir(src, { withFileTypes: true });
 	for (const entry of entries) {
 		const srcPath = join(src, entry.name);
 		const destPath = join(dest, entry.name);
 		if (entry.isDirectory()) {
-			copyDirRecursive(srcPath, destPath);
+			await copyDirAsync(srcPath, destPath);
 		} else {
 			cpSync(srcPath, destPath);
 		}
@@ -136,7 +127,7 @@ function generateServerCode(port: number): string {
 	return `
 import { Server } from './server/index.js';
 import { manifest, prerendered, base } from './server/manifest.js';
-import { existsSync } from 'node:fs';
+import { Glob } from 'bun';
 import { join } from 'node:path';
 
 const ADAPTER_NAME = 'svelte-adapter-bun-isr';
@@ -151,30 +142,55 @@ await server.init({
   read: (file) => Bun.file(join(ASSET_DIR, file)).stream(),
 });
 
-async function getRevalidateForPath(pathname) {
-  const routes = manifest._?.routes || [];
-  for (const route of routes) {
-    if (route.pattern && route.pattern.test(pathname)) {
-      const page = route.page;
-      if (page) {
-        for (const leafIdx of page.layouts || []) {
-          try {
-            const mod = await manifest._.nodes[leafIdx]();
-            if (mod && mod.config && typeof mod.config.revalidate === 'number') {
-              return mod.config.revalidate;
-            }
-          } catch {}
-        }
-        if (typeof page.leaf === 'number') {
-          try {
-            const mod = await manifest._.nodes[page.leaf]();
-            if (mod && mod.config && typeof mod.config.revalidate === 'number') {
-              return mod.config.revalidate;
-            }
-          } catch {}
-        }
+// Pre-compute: build a Set of all client asset paths for O(1) lookups
+// instead of calling existsSync on every request
+const clientAssets = new Set();
+const assetGlob = new Glob('**/*');
+for await (const entry of assetGlob.scan({ cwd: ASSET_DIR, onlyFiles: true, absolute: false })) {
+  clientAssets.add('/' + base + '/' + entry);
+}
+
+// Pre-compute: build a Map of regex -> revalidate duration from manifest routes
+// This eliminates per-request route pattern matching and dynamic imports
+const revalidateMap = new Map();
+const routes = manifest._?.routes || [];
+for (const route of routes) {
+  if (!route.pattern) continue;
+  const page = route.page;
+  if (!page) continue;
+
+  let revalidate = null;
+
+  // Check layouts first
+  for (const leafIdx of page.layouts || []) {
+    try {
+      const mod = await manifest._.nodes[leafIdx]();
+      if (mod?.config && typeof mod.config.revalidate === 'number') {
+        revalidate = mod.config.revalidate;
+        break;
       }
-      return null;
+    } catch {}
+  }
+
+  // Check leaf if no layout had revalidate
+  if (revalidate === null && typeof page.leaf === 'number') {
+    try {
+      const mod = await manifest._.nodes[page.leaf]();
+      if (mod?.config && typeof mod.config.revalidate === 'number') {
+        revalidate = mod.config.revalidate;
+      }
+    } catch {}
+  }
+
+  if (revalidate !== null) {
+    revalidateMap.set(route.pattern, revalidate);
+  }
+}
+
+function getRevalidateForPath(pathname) {
+  for (const [pattern, revalidate] of revalidateMap) {
+    if (pattern.test(pathname)) {
+      return revalidate;
     }
   }
   return null;
@@ -193,67 +209,67 @@ function setCache(pathname, html, revalidate) {
   ISR_CACHE.set(pathname, { html, timestamp: Date.now(), revalidate });
 }
 
-function serveStatic(pathname) {
-  const filePath = join(ASSET_DIR, pathname);
-  if (existsSync(filePath)) {
-    const file = Bun.file(filePath);
-    const headers = {};
-    if (pathname.includes('/immutable/')) {
-      headers['cache-control'] = 'public,max-age=31536000,immutable';
-    }
-    return new Response(file, { headers });
-  }
-  return null;
-}
-
-function servePrerendered(pathname) {
-  const tryPaths = [
-    join(PRERENDERED_DIR, pathname),
-    join(PRERENDERED_DIR, pathname + '.html'),
-    join(PRERENDERED_DIR, pathname, 'index.html'),
+// Pre-compute: build a Map of prerendered page -> pre-opened BunFile
+// for zero-allocation, zero-syscall serving
+const prerenderedFiles = new Map();
+for (const p of prerendered) {
+  const candidates = [
+    join(PRERENDERED_DIR, p),
+    join(PRERENDERED_DIR, p + '.html'),
+    join(PRERENDERED_DIR, p, 'index.html'),
   ];
-  for (const tryPath of tryPaths) {
-    if (existsSync(tryPath)) {
-      return new Response(Bun.file(tryPath), {
-        headers: { 'Content-Type': 'text/html' },
-      });
+  for (const filePath of candidates) {
+    const f = Bun.file(filePath);
+    if (await f.exists()) {
+      prerenderedFiles.set(p, f);
+      break;
     }
   }
-  return null;
 }
 
 const bunServer = Bun.serve({
   port: ${port},
+  idleTimeout: 0,
+  reusePort: true,
+  development: false,
+
   async fetch(request) {
     const url = new URL(request.url);
     let pathname = url.pathname;
 
-    // Serve static client assets
-    if (pathname.startsWith(base)) {
-      const staticResponse = serveStatic(pathname);
-      if (staticResponse) return staticResponse;
+    // 1. Serve static client assets (O(1) Set lookup)
+    if (clientAssets.has(pathname)) {
+      const filePath = join(ASSET_DIR, pathname.slice(base.length + 1) || pathname);
+      const file = Bun.file(filePath);
+      const headers = {};
+      if (pathname.includes('/immutable/')) {
+        headers['cache-control'] = 'public,max-age=31536000,immutable';
+      }
+      return new Response(file, { headers });
     }
 
-    // Serve prerendered pages
-    if (prerendered.has(pathname)) {
-      const prerenderedResponse = servePrerendered(pathname);
-      if (prerenderedResponse) return prerenderedResponse;
+    // 2. Serve prerendered pages (O(1) Map lookup, pre-opened BunFile)
+    const prerenderedFile = prerenderedFiles.get(pathname);
+    if (prerenderedFile) {
+      return new Response(prerenderedFile, {
+        headers: { 'Content-Type': 'text/html' },
+      });
     }
 
-    // Try ISR cache
+    // 3. Try ISR cache (O(1) Map lookup)
     const cached = getCached(pathname);
     if (cached) {
       return new Response(cached, { status: 200, headers: { 'Content-Type': 'text/html' } });
     }
 
-    // Forward to SvelteKit
+    // 4. Forward to SvelteKit
     const response = await server.respond(request, {
       platform: { server: bunServer, request },
     });
 
-    // Cache 200 responses with revalidate config
+    // 5. Cache 200 responses with revalidate config (pre-computed map)
     if (response.status === 200) {
-      const revalidate = await getRevalidateForPath(pathname);
+      const revalidate = getRevalidateForPath(pathname);
       if (revalidate && revalidate > 0) {
         const clone = response.clone();
         const html = await clone.text();
