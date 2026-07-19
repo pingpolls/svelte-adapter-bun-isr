@@ -1,12 +1,45 @@
 {
-	"name": "svelte-adapter-bun-isr",
-	"module": "src/index.ts",
-	"type": "module",
-	"devDependencies": {
-		"@types/bun": "latest"
+	"name": "@pingpolls/svelte-adapter-bun-isr",
+	"version": "0.1.0",
+	"description": "SvelteKit adapter for Bun with Incremental Static Regeneration (ISR) support",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/pingpolls/svelte-adapter-bun-isr.git"
 	},
+	"keywords": [
+		"sveltekit",
+		"adapter",
+		"bun",
+		"ssr",
+		"isr",
+		"static",
+		"svelte"
+	],
+	"type": "module",
+	"main": "dist/index.js",
+	"module": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist"
+	],
 	"scripts": {
-		"build": "bun src/index.ts",
-		"test": "bun test"
+		"build": "rm -rf dist && bun build ./src/index.ts --outdir ./dist --target bun --minify && bun x tsc --project tsconfig.build.json",
+		"test": "bun test",
+		"release": "bun run build && bun test && bunx --bun npm publish --access public"
+	},
+	"peerDependencies": {
+		"@sveltejs/kit": ">=2.0.0"
+	},
+	"devDependencies": {
+		"@sveltejs/kit": "^2.70.1",
+		"@types/bun": "latest",
+		"typescript": "^5.0.0"
 	}
 }
