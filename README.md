@@ -1,4 +1,4 @@
-# @pingpolls/svelte-adapter-bun-isr
+# SvelteKit Bun Adapter ISR 
 
 A SvelteKit adapter for Bun that supports:
 
@@ -33,9 +33,30 @@ bun add @pingpolls/svelte-adapter-bun-isr
 
 ## Usage
 
-In `svelte.config.js`:
+In `vite.config.ts`
 
-```js
+```ts
+import adapter from '@pingpolls/svelte-adapter-bun-isr';
+
+export default defineConfig({
+	plugins: [
+		sveltekit({
+			adapter: adapter({
+        out: 'build',
+        serveAssets: true,
+        precompress: true,
+        envPrefix: '',
+        idleTimeout: 10,
+        websockets: true
+      }),
+		}),
+	],
+});
+```
+
+or in `svelte.config.ts`:
+
+```ts
 import adapter from '@pingpolls/svelte-adapter-bun-isr';
 
 export default {
@@ -243,6 +264,10 @@ This adapter uses:
 - SvelteKit adapter APIs
 - generated manifest metadata for prerendered paths and ISR revalidate mapping
 
+## Contributing
+
+See our [Github](https://github.com/pingpolls/svelte-adapter-bun-isr)
+
 ## License
 
-Add the appropriate project license here.
+MIT
