@@ -16,7 +16,7 @@ interface AdapterOptions {
  * import type { Config } from '@pingpolls/svelte-adapter-bun-isr';
  *
  * export const prerender = 'auto'; // NOT `true` — see note below
- * export const config: Config = { revalidate: 5000 }; // ms
+ * export const config: Config = { revalidate: 5 }; // Sec
  * ```
  *
  * `revalidate` only has an effect on routes that are also prerendered. Use
@@ -214,11 +214,11 @@ for (const p of prerendered) {
 // In-memory ISR cache: pathname -> latest regenerated HTML.
 // Overrides the build-time static file once the first background regeneration completes.
 // NOTE: resets on process restart (falls back to the build-time file, which is still valid
-// HTML, just up to \`revalidate\` ms stale). Persist to disk here if you need cross-restart freshness.
+// HTML, just up to \`revalidate\` s stale). Persist to disk here if you need cross-restart freshness.
 const isrCache = new Map();
 const timers = [];
 
-// isrRevalidate is a plain { [path]: revalidateMs } map, fully resolved at build time from
+// isrRevalidate is a plain { [path]: revalidateSec } map, fully resolved at build time from
 // each route's \`export const config: Config = { revalidate }\` (merged across the layout
 // chain by SvelteKit itself, see adapter's adapt()). No manifest/node introspection needed here.
 for (const [path, revalidate] of Object.entries(isrRevalidate)) {
@@ -238,8 +238,8 @@ for (const [path, revalidate] of Object.entries(isrRevalidate)) {
     }
   };
 
-  console.log(\`[\${ADAPTER_NAME}] ISR enabled: \${path} (every \${revalidate}ms)\`);
-  timers.push(setInterval(regenerate, revalidate));
+  console.log(\`[\${ADAPTER_NAME}] ISR enabled: \${path} (every \${revalidate}Sec)\`);
+  timers.push(setInterval(regenerate, revalidate * 1000));
 }
 
 const bunServer = Bun.serve({
