@@ -15,13 +15,15 @@ interface AdapterOptions {
  * ```ts
  * import type { Config } from '@pingpolls/svelte-adapter-bun-isr';
  *
- * export const prerender = true;
+ * export const prerender = 'auto'; // NOT `true` — see note below
  * export const config: Config = { revalidate: 5000 }; // ms
  * ```
  *
- * `revalidate` only has an effect on routes that are also prerendered — the page is built
- * statically as usual, then the adapter's runtime background worker re-renders it on that
- * interval and swaps in the fresh HTML.
+ * `revalidate` only has an effect on routes that are also prerendered. Use
+ * `export const prerender = 'auto'`, not `true`: SvelteKit strips fully-prerendered
+ * (`true`) routes from the SSR manifest entirely, so there'd be nothing left for the
+ * adapter's background worker to re-render at runtime. `'auto'` still produces the static
+ * file at build time, but keeps the route reachable via `server.respond()` for regeneration.
  */
 export interface Config {
 	revalidate?: number;
@@ -67,9 +69,24 @@ export default function (options: AdapterOptions = {}): Adapter {
 			for (const path of builder.prerendered.paths) {
 				const route = builder.routes.find((r) => r.pattern.test(path));
 				const revalidate = (route?.config as Config | undefined)?.revalidate;
-				if (typeof revalidate === "number" && revalidate > 0) {
-					isrRevalidate[path] = revalidate;
+				if (typeof revalidate !== "number" || revalidate <= 0) continue;
+
+				// `prerender = true` strips the route from the SSR manifest entirely (SvelteKit
+				// does this to shrink the server bundle), which means our runtime regenerate()
+				// call — which goes through server.respond() — has nothing to match and always
+				// 404s. `'auto'` keeps the static output *and* keeps the route in the manifest,
+				// which is exactly what ISR needs.
+				if (route?.prerender !== "auto") {
+					builder.log.warn(
+						`[${ADAPTER_NAME}] ${path} sets config.revalidate but "export const prerender" ` +
+							`is not 'auto'. Routes with prerender = true are stripped from the SSR ` +
+							`manifest, so the adapter can't re-render them at runtime — ISR will be a ` +
+							`no-op here. Change to \`export const prerender = 'auto'\` to enable it.`,
+					);
+					continue;
 				}
+
+				isrRevalidate[path] = revalidate;
 			}
 
 			writeFileSync(
