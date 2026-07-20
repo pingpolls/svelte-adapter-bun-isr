@@ -6,6 +6,8 @@ export const prerender = "auto";
 export const config: Config = { revalidate: 10 };
 
 export const GET = async () => {
+  console.info("Rerunning server load")
+
 	const todos = getTodos();
 
 	return json({

@@ -1,156 +1,308 @@
-import { afterEach, expect, test } from "bun:test";
-import { existsSync, rmSync } from "node:fs";
+// isr.test.ts
+import { expect, test } from "bun:test";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
-import { type Subprocess, spawn } from "bun";
 
-const FIXTURES = join(import.meta.dir, "..", "fixtures");
-const BUILD_DIR = join(FIXTURES, "build");
-const DB_PATH = join(FIXTURES, "fixture.sqlite");
+const FIXTURE_DIR = process.env.FIXTURE_DIR ?? join(process.cwd(), "fixtures");
+const BASE_URL = process.env.BASE_URL ?? "http://localhost:3000";
 
-const PORT = 3000;
-const BASE = `http://localhost:${PORT}`;
+const PREP_CMD = ["bun", "run", "prepare"];
+const BUILD_CMD = ["bun", "run", "build"];
+const START_CMD = ["bun", "run", "start"];
+const MIGRATE_CMD = ["bun", "./src/scripts/prep.ts"];
 
-let server: Subprocess | null = null;
+const PAGE_PATHS = [
+	"/no-isr/page",
+	"/no-isr/server",
+	"/isr/page",
+	"/isr/server",
+] as const;
 
-// ---------- helpers ----------
+type Todo = { id: number; text: string };
+type TodosResponse = { todos: Todo[] };
 
-async function build(): Promise<void> {
-	const proc = spawn(["bunx", "vite", "build"], {
-		cwd: FIXTURES,
-		stdio: ["inherit", "pipe", "pipe"],
-	});
-	const exitCode = await proc.exited;
-	if (exitCode !== 0) {
-		const stderr = await new Response(proc.stderr).text();
-		throw new Error(`Build failed: ${stderr}`);
-	}
-}
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function startServer(): Promise<Subprocess> {
-	const entry = join(BUILD_DIR, "index.js");
-	if (!existsSync(entry)) {
-		throw new Error(`Missing build entry: ${entry}`);
-	}
-
-	const proc = spawn(["bun", entry], {
-		cwd: FIXTURES,
-		env: { ...process.env, PORT: String(PORT) },
-		stdio: ["inherit", "pipe", "pipe"],
+async function runCommand(cmd: string[], cwd: string) {
+	const proc = Bun.spawnSync({
+		cmd,
+		cwd,
+		stdout: "pipe",
+		stderr: "pipe",
 	});
 
-	// wait for server boot
-	await new Promise((r) => setTimeout(r, 2000));
+	if (proc.exitCode !== 0) {
+		const stdout = new TextDecoder().decode(proc.stdout);
+		const stderr = new TextDecoder().decode(proc.stderr);
+		throw new Error(
+			[
+				`Command failed: ${cmd.join(" ")}`,
+				`cwd: ${cwd}`,
+				`exitCode: ${proc.exitCode}`,
+				stdout ? `stdout:\n${stdout}` : "",
+				stderr ? `stderr:\n${stderr}` : "",
+			]
+				.filter(Boolean)
+				.join("\n\n"),
+		);
+	}
+
 	return proc;
 }
 
-function stopServer() {
-	if (server) {
-		server.kill();
-		server = null;
+async function cleanupFixtureArtifacts() {
+	await rm(join(FIXTURE_DIR, "build"), { recursive: true, force: true });
+	await rm(join(FIXTURE_DIR, "dist"), { recursive: true, force: true });
+
+	await rm(join(FIXTURE_DIR, "db.sqlite"), { force: true });
+	await rm(join(FIXTURE_DIR, "db.sqlite-wal"), { force: true });
+	await rm(join(FIXTURE_DIR, "db.sqlite-shm"), { force: true });
+}
+
+async function waitForServerUp(url: string, timeoutMs = 30_000) {
+	const started = Date.now();
+	let lastError: unknown = null;
+
+	while (Date.now() - started < timeoutMs) {
+		try {
+			const res = await fetch(url, { cache: "no-store" });
+			if (res.ok) return;
+			lastError = new Error(`Unexpected status ${res.status}`);
+		} catch (error) {
+			lastError = error;
+		}
+
+		await sleep(250);
 	}
+
+	throw new Error(`Server did not become ready: ${String(lastError)}`);
 }
 
-async function getTodos() {
-	const res = await fetch(`${BASE}/api/todos`);
-	expect(res.status).toBe(200);
-	return await res.json();
+async function waitForServerDown(url: string, timeoutMs = 10_000) {
+	const started = Date.now();
+
+	while (Date.now() - started < timeoutMs) {
+		try {
+			const res = await fetch(url, { cache: "no-store" });
+			if (!res.ok) return;
+		} catch {
+			return;
+		}
+
+		await sleep(250);
+	}
+
+	throw new Error("Server did not stop in time");
 }
 
-async function addTodo(text: string) {
-	const res = await fetch(`${BASE}/api/todos`, {
+async function fetchText(pathname: string) {
+	const res = await fetch(new URL(pathname, BASE_URL), {
+		cache: "no-store",
+		headers: { accept: "text/html" },
+	});
+
+	expect(res.ok).toBe(true);
+	return await res.text();
+}
+
+async function fetchTodos(pathname: string) {
+	const res = await fetch(new URL(pathname, BASE_URL), {
+		cache: "no-store",
+		headers: { accept: "application/json" },
+	});
+
+	expect(res.ok).toBe(true);
+
+	const data = (await res.json()) as TodosResponse;
+	expect(Array.isArray(data.todos)).toBe(true);
+	return data.todos;
+}
+
+async function createTodo(text: string) {
+	const res = await fetch(new URL("/api/todos", BASE_URL), {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		cache: "no-store",
+		headers: {
+			"content-type": "application/json",
+			accept: "application/json",
+		},
 		body: JSON.stringify({ text }),
 	});
-	expect(res.status).toBe(200);
+
+	expect(res.ok).toBe(true);
 }
 
-async function expectTodosCount(count: number) {
-	const todos = await getTodos();
-	expect(todos.length).toBe(count);
-	return todos;
+function escapeRegExp(input: string) {
+	return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-// ---------- lifecycle ----------
+function countLisInsideSection(html: string, sectionId: string) {
+	const sectionMatch = html.match(
+		new RegExp(
+			`<section\\s+id="${escapeRegExp(sectionId)}"[^>]*>([\\s\\S]*?)<\\/section>`,
+			"i",
+		),
+	);
 
-afterEach(() => {
-	stopServer();
-});
+	expect(sectionMatch).not.toBeNull();
 
-// ---------- main test ----------
+	const sectionHtml = sectionMatch?.[1] ?? "";
+	const ulMatch = sectionHtml.match(/<ul[^>]*>([\s\S]*?)<\/ul>/i);
 
-test("full ISR flow", async () => {
-	// 1. build
-	await build();
-	expect(existsSync(BUILD_DIR)).toBe(true);
+	expect(ulMatch).not.toBeNull();
 
-	// 2. start server
-	server = await startServer();
+	const ulHtml = ulMatch?.[1] ?? "";
+	const liMatches = ulHtml.match(/<li\b[^>]*>[\s\S]*?<\/li>/gi) ?? [];
+	return liMatches.length;
+}
 
-	// 3. both pages should have empty todo
-	await expectTodosCount(0);
+function assertHtmlTodoState(
+	html: string,
+	expectedPageCount: number,
+	expectedLayoutCount: number,
+	expectedText?: string,
+) {
+	expect(countLisInsideSection(html, "page-todo")).toBe(expectedPageCount);
+	expect(countLisInsideSection(html, "layout-todo")).toBe(expectedLayoutCount);
 
-	// 4. add 3 todos
-	await addTodo("todo 1");
-	await addTodo("todo 2");
-	await addTodo("todo 3");
-
-	const todosAfterInsert = await expectTodosCount(3);
-	expect(todosAfterInsert.map((t: any) => t.text)).toEqual([
-		"todo 1",
-		"todo 2",
-		"todo 3",
-	]);
-
-	// 5. ISR behavior check immediately
-	const withISR_1 = await fetch(`${BASE}/with-isr`).then((r) => r.text());
-	const withoutISR_1 = await fetch(`${BASE}/without-isr`).then((r) => r.text());
-
-	expect(withISR_1).toContain("0"); // still cached
-	expect(withoutISR_1).toContain("0"); // static
-
-	// 6. wait 10s for ISR revalidate
-	await new Promise((r) => setTimeout(r, 10000));
-
-	const withISR_2 = await fetch(`${BASE}/with-isr`).then((r) => r.text());
-	const withoutISR_2 = await fetch(`${BASE}/without-isr`).then((r) => r.text());
-
-	expect(withISR_2).toContain("3"); // updated
-	expect(withoutISR_2).toContain("0"); // still static
-
-	// 7. stop server
-	stopServer();
-
-	// ensure stopped
-	let failed = false;
-	try {
-		await fetch(`${BASE}`);
-	} catch {
-		failed = true;
+	if (expectedText) {
+		expect(html).toContain(expectedText);
 	}
-	expect(failed).toBe(true);
+}
 
-	// 8. rebuild
-	await build();
+async function assertPageState(
+	pathname: string,
+	expectedPageCount: number,
+	expectedLayoutCount: number,
+	expectedText?: string,
+) {
+	const html = await fetchText(pathname);
+	assertHtmlTodoState(
+		html,
+		expectedPageCount,
+		expectedLayoutCount,
+		expectedText,
+	);
+}
 
-	// 9. restart
-	server = await startServer();
+async function assertServerState(
+	pathname: string,
+	expectedCount: number,
+	expectedText?: string,
+) {
+	const todos = await fetchTodos(pathname);
+	expect(todos).toHaveLength(expectedCount);
 
-	// 10. both pages should now show 3 (fresh build snapshot)
-	const withISR_3 = await fetch(`${BASE}/with-isr`).then((r) => r.text());
-	const withoutISR_3 = await fetch(`${BASE}/without-isr`).then((r) => r.text());
-
-	expect(withISR_3).toContain("3");
-	expect(withoutISR_3).toContain("3");
-
-	// 11. cleanup
-	stopServer();
-
-	if (existsSync(BUILD_DIR)) {
-		rmSync(BUILD_DIR, { recursive: true, force: true });
+	if (expectedCount > 0) {
+		expect(typeof todos[0]?.id).toBe("number");
+		expect(typeof todos[0]?.text).toBe("string");
 	}
 
-	if (existsSync(DB_PATH)) {
-		rmSync(DB_PATH, { force: true });
+	if (expectedText) {
+		expect(todos.some((todo) => todo.text === expectedText)).toBe(true);
 	}
-});
+}
+
+test(
+	"build, start, ISR timeline, restart, rebuild, and cleanup",
+	async () => {
+		const todoText = `bun-isr-${Date.now()}`;
+		let server: ReturnType<typeof Bun.spawn> | null = null;
+
+		try {
+			await runCommand(PREP_CMD, FIXTURE_DIR);
+			await runCommand(MIGRATE_CMD, FIXTURE_DIR);
+			await runCommand(BUILD_CMD, FIXTURE_DIR);
+
+			server = Bun.spawn({
+				cmd: START_CMD,
+				cwd: FIXTURE_DIR,
+				stdout: "inherit",
+				stderr: "inherit",
+			});
+
+			await waitForServerUp(BASE_URL);
+
+			for (const path of PAGE_PATHS) {
+				if (path.endsWith("/page")) {
+					await assertPageState(path, 0, 0);
+				} else {
+					await assertServerState(path, 0);
+				}
+			}
+
+			await createTodo(todoText);
+
+			for (const path of PAGE_PATHS) {
+				if (path.endsWith("/page")) {
+					await assertPageState(path, 0, 0);
+				} else {
+					await assertServerState(path, 0);
+				}
+			}
+
+			await sleep(5100);
+
+			await assertPageState("/no-isr/page", 0, 0);
+			await assertServerState("/no-isr/server", 0);
+
+			await assertPageState("/isr/page", 1, 0, todoText);
+			await assertServerState("/isr/server", 0);
+
+			await sleep(5100);
+
+			await assertPageState("/no-isr/page", 0, 0);
+			await assertServerState("/no-isr/server", 0);
+
+			await assertPageState("/isr/page", 1, 0, todoText);
+			await assertServerState("/isr/server", 1, todoText);
+
+			await sleep(5100);
+
+			await assertPageState("/no-isr/page", 0, 0);
+			await assertServerState("/no-isr/server", 0);
+
+			await assertPageState("/isr/page", 1, 1, todoText);
+			await assertServerState("/isr/server", 1, todoText);
+
+			server.kill("SIGTERM");
+			await waitForServerDown(BASE_URL);
+
+			server = null;
+
+			await runCommand(BUILD_CMD, FIXTURE_DIR);
+
+			server = Bun.spawn({
+				cmd: START_CMD,
+				cwd: FIXTURE_DIR,
+				stdout: "inherit",
+				stderr: "inherit",
+			});
+
+			await waitForServerUp(BASE_URL);
+
+			await assertPageState("/no-isr/page", 1, 1, todoText);
+			await assertServerState("/no-isr/server", 1, todoText);
+
+			await assertPageState("/isr/page", 1, 1, todoText);
+			await assertServerState("/isr/server", 1, todoText);
+		} finally {
+			if (server) {
+				try {
+					server.kill("SIGTERM");
+				} catch {
+					// ignore
+				}
+
+				try {
+					await waitForServerDown(BASE_URL);
+				} catch {
+					// ignore
+				}
+			}
+
+			await cleanupFixtureArtifacts();
+		}
+	},
+	{ timeout: 180_000 },
+);
