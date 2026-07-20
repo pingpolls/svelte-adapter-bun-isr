@@ -210,134 +210,178 @@ describe("ISR / no-ISR revalidation lifecycle", () => {
 		rmIfExists(DB_PATH);
 	});
 
-	test("Migrate the initial schema, then build the SvelteKit project", async () => {
-		runCmd(PREP_CMD, "prepping");
-		runCmd(MIGRATE_CMD, "migrate");
-		const build1 = runCmd(BUILD_CMD, "build#1");
-		expect(build1.exitCode).toBe(0);
-		expect(existsSync(BUILD_DIR)).toBe(true);
-	});
+	test(
+		"Migrate the initial schema, then build the SvelteKit project",
+		async () => {
+			runCmd(PREP_CMD, "prepping");
+			runCmd(MIGRATE_CMD, "migrate");
+			const build1 = runCmd(BUILD_CMD, "build#1");
+			expect(build1.exitCode).toBe(0);
+			expect(existsSync(BUILD_DIR)).toBe(true);
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
 
-	test("Start `bun run start` in the background and confirm it boots.", async () => {
-		server = await startServer();
-		expect(server.exitCode).toBeNull();
-	});
+	test(
+		"Start `bun run start` in the background and confirm it boots.",
+		async () => {
+			server = await startServer();
+			expect(server.exitCode).toBeNull();
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
 
-	test("Everything should start out empty.", async () => {
-		for (const p of ["/no-isr/page", "/isr/page", "/isr/layout"]) {
-			const list = await fetchPageSections(p);
-			expect(list.length).toBe(0);
-		}
-		for (const p of ["/no-isr/server", "/isr/server"]) {
-			expect((await fetchJsonTodos(p)).length).toBe(0);
-		}
-	});
-	test("Immediately after creation, nothing should reflect it yet.", async () => {
-		await createTodo("wash the dishes");
+	test(
+		"Everything should start out empty.",
+		async () => {
+			for (const p of ["/no-isr/page", "/isr/page", "/isr/layout"]) {
+				const list = await fetchPageSections(p);
+				expect(list.length).toBe(0);
+			}
+			for (const p of ["/no-isr/server", "/isr/server"]) {
+				expect((await fetchJsonTodos(p)).length).toBe(0);
+			}
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
+	test(
+		"Immediately after creation, nothing should reflect it yet.",
+		async () => {
+			await createTodo("wash the dishes");
 
-		//    (no-isr should still be re-fetched fresh though — assumed to be
-		//    request-time in this app's contract, so we check it's empty
-		//    only because the underlying write path is presumed async /
-		//    not yet visible; if no-isr is truly always-fresh, this only
-		//    guards the ISR routes staying stale).
-		for (const p of ["/no-isr/page", "/isr/page", "/isr/layout"]) {
-			const list = await fetchPageSections(p);
-			expect(list.length).toBe(0);
-		}
-		for (const p of ["/no-isr/server", "/isr/server"]) {
-			expect((await fetchJsonTodos(p)).length).toBe(0);
-		}
-	});
+			//    (no-isr should still be re-fetched fresh though — assumed to be
+			//    request-time in this app's contract, so we check it's empty
+			//    only because the underlying write path is presumed async /
+			//    not yet visible; if no-isr is truly always-fresh, this only
+			//    guards the ISR routes staying stale).
+			for (const p of ["/no-isr/page", "/isr/page", "/isr/layout"]) {
+				const list = await fetchPageSections(p);
+				expect(list.length).toBe(0);
+			}
+			for (const p of ["/no-isr/server", "/isr/server"]) {
+				expect((await fetchJsonTodos(p)).length).toBe(0);
+			}
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
 
-	test("Wait 5s (isr/page's 5s revalidate window should now have elapsed)", async () => {
-		await Bun.sleep(5 * 1000);
+	test(
+		"Wait 5s (isr/page's 5s revalidate window should now have elapsed)",
+		async () => {
+			await Bun.sleep(5 * 1000);
 
-		for (const p of [
-			"/no-isr/page",
-			"/no-isr/server",
-			"/isr/server",
-			"/isr/layout",
-		]) {
-			const count = p.includes("server")
-				? (await fetchJsonTodos(p)).length
-				: (await fetchPageSections(p)).length;
-			expect(count).toBe(0);
-		}
-		{
-			const list = await fetchPageSections("/isr/page");
-			expect(list.length).toBe(1);
-		}
-	});
+			for (const p of [
+				"/no-isr/page",
+				"/no-isr/server",
+				"/isr/server",
+				"/isr/layout",
+			]) {
+				const count = p.includes("server")
+					? (await fetchJsonTodos(p)).length
+					: (await fetchPageSections(p)).length;
+				expect(count).toBe(0);
+			}
+			{
+				const list = await fetchPageSections("/isr/page");
+				expect(list.length).toBe(1);
+			}
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
 
-	test("Wait 5 more seconds (t=10s: isr/server's 10s window elapses).", async () => {
-		await Bun.sleep(5 * 1000);
+	test(
+		"Wait 5 more seconds (t=10s: isr/server's 10s window elapses).",
+		async () => {
+			await Bun.sleep(5 * 1000);
 
-		for (const p of ["/no-isr/page", "/no-isr/server", "/isr/layout"]) {
-			const count = p.includes("server")
-				? (await fetchJsonTodos(p)).length
-				: (await fetchPageSections(p)).length;
-			expect(count).toBe(0);
-		}
-		{
-			const list = await fetchPageSections("/isr/page");
-			expect(list.length).toBe(1);
-		}
-		expect((await fetchJsonTodos("/isr/server")).length).toBe(1);
-	});
+			for (const p of ["/no-isr/page", "/no-isr/server", "/isr/layout"]) {
+				const count = p.includes("server")
+					? (await fetchJsonTodos(p)).length
+					: (await fetchPageSections(p)).length;
+				expect(count).toBe(0);
+			}
+			{
+				const list = await fetchPageSections("/isr/page");
+				expect(list.length).toBe(1);
+			}
+			expect((await fetchJsonTodos("/isr/server")).length).toBe(1);
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
 
-	test("Wait 5 more seconds (t=15s: isr layout's 15s window elapses)", async () => {
-		await Bun.sleep(5 * 1000);
+	test(
+		"Wait 5 more seconds (t=15s: isr layout's 15s window elapses)",
+		async () => {
+			await Bun.sleep(5 * 1000);
 
-		for (const p of ["/no-isr/page", "/no-isr/server"]) {
-			const count =
-				p === "/no-isr/page"
-					? (await fetchPageSections(p)).length
-					: (await fetchJsonTodos(p)).length;
-			expect(count).toBe(0);
-		}
-		for (const p of ["/isr/page", "/isr/layout"]) {
-			const list = await fetchPageSections(p);
-			expect(list.length).toBe(1);
-		}
-		expect((await fetchJsonTodos("/isr/server")).length).toBe(1);
-	});
+			for (const p of ["/no-isr/page", "/no-isr/server"]) {
+				const count =
+					p === "/no-isr/page"
+						? (await fetchPageSections(p)).length
+						: (await fetchJsonTodos(p)).length;
+				expect(count).toBe(0);
+			}
+			for (const p of ["/isr/page", "/isr/layout"]) {
+				const list = await fetchPageSections(p);
+				expect(list.length).toBe(1);
+			}
+			expect((await fetchJsonTodos("/isr/server")).length).toBe(1);
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
 
-	test("Stop the server and verify it's actually down.Rebuild the project and confirm the build succeeds.", async () => {
-		if (server) {
-			await stopServerAndVerify(server);
-			server = null;
-		}
-		const build2 = runCmd(BUILD_CMD, "build#2");
-		expect(build2.exitCode).toBe(0);
-		expect(existsSync(BUILD_DIR)).toBe(true);
-	});
+	test(
+		"Stop the server and verify it's actually down.Rebuild the project and confirm the build succeeds.",
+		async () => {
+			if (server) {
+				await stopServerAndVerify(server);
+				server = null;
+			}
+			const build2 = runCmd(BUILD_CMD, "build#2");
+			expect(build2.exitCode).toBe(0);
+			expect(existsSync(BUILD_DIR)).toBe(true);
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
 
-	test("Restart server succeed after new build.", async () => {
-		server = await startServer();
-		expect(server.exitCode).toBeNull();
-	});
+	test(
+		"Restart server succeed after new build.",
+		async () => {
+			server = await startServer();
+			expect(server.exitCode).toBeNull();
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
 
-	test("All page should have todo.", async () => {
-		for (const p of ["/no-isr/page", "/isr/page", "/isr/layout"]) {
-			const list = await fetchPageSections(p);
-			expect(list.length).toBe(1);
-		}
-		for (const p of ["/no-isr/server", "/isr/server"]) {
-			expect((await fetchJsonTodos(p)).length).toBe(1);
-		}
-	});
+	test(
+		"All page should have todo.",
+		async () => {
+			for (const p of ["/no-isr/page", "/isr/page", "/isr/layout"]) {
+				const list = await fetchPageSections(p);
+				expect(list.length).toBe(1);
+			}
+			for (const p of ["/no-isr/server", "/isr/server"]) {
+				expect((await fetchJsonTodos(p)).length).toBe(1);
+			}
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
 
-	test("Cleanup server", async () => {
-		if (server) {
-			await stopServerAndVerify(server);
-			expect(server.exitCode).not.toBeNull();
-			server = null;
-		}
-		rmIfExists(BUILD_DIR);
-		rmIfExists(SVELTEKIT_DIR);
-		rmIfExists(DB_PATH);
-		expect(existsSync(BUILD_DIR)).toBe(false);
-		expect(existsSync(SVELTEKIT_DIR)).toBe(false);
-		expect(existsSync(DB_PATH)).toBe(false);
-	});
+	test(
+		"Cleanup server",
+		async () => {
+			if (server) {
+				await stopServerAndVerify(server);
+				expect(server.exitCode).not.toBeNull();
+				server = null;
+			}
+			rmIfExists(BUILD_DIR);
+			rmIfExists(SVELTEKIT_DIR);
+			rmIfExists(DB_PATH);
+			expect(existsSync(BUILD_DIR)).toBe(false);
+			expect(existsSync(SVELTEKIT_DIR)).toBe(false);
+			expect(existsSync(DB_PATH)).toBe(false);
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
 });
