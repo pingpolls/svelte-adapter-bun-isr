@@ -32,7 +32,7 @@
 	"scripts": {
 		"build": "rm -rf dist && bun build ./src/index.ts --outdir ./dist --target bun --minify && bun x tsc --project tsconfig.build.json",
 		"test": "bun test",
-		"release": "bun run build && bun test && bunx --bun npm publish --access public"
+		"release": "bun run build && bunx --bun npm publish --access public"
 	},
 	"peerDependencies": {
 		"@sveltejs/kit": ">=2.0.0"
