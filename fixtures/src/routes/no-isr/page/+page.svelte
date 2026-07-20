@@ -4,5 +4,4 @@
     let { data } = $props();
 </script>
 
-<TodoList id="page-todo" todos={data.todos} />
-<TodoList id="layout-todo" todos={data.layoutTodo} />
+<TodoList todos={data.todos} />

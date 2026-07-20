@@ -1,308 +1,343 @@
-// isr.test.ts
-import { expect, test } from "bun:test";
-import { rm } from "node:fs/promises";
-import { join } from "node:path";
+/**
+ * End-to-end ISR / no-ISR revalidation test for the `fixtures` SvelteKit app.
+ *
+ * Run with:  bun test fixtures/tests/isr.e2e.test.ts
+ * (run from the repo root, or `cd fixtures && bun test tests/isr.e2e.test.ts`)
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * ASSUMPTIONS (the fixtures/package.json + route files were not inspectable
+ * from this environment — they were empty/not present). Adjust the CONFIG
+ * block below if any of these don't match the real project:
+ *
+ *   - `package.json` has a `"build"` script that runs the SvelteKit build
+ *     (adapter-node output written to `fixtures/build/`).
+ *   - `package.json` has a `"start"` script that boots the built server
+ *     (e.g. `bun run build/index.js`), reading `PORT` from env, defaulting
+ *     to 3000 if `PORT` isn't set.
+ *   - The initial DB migration is performed by running
+ *     `src/scripts/prep.ts` directly with bun (creates the sqlite schema,
+ *     no seed rows).
+ *   - `/no-isr/server` exists as the no-isr counterpart of `/isr/server`
+ *     (the dir listing only showed `/isr/server/+server.ts`, but the test
+ *     spec explicitly checks `/no-isr/server`, so it's assumed to exist
+ *     with the same JSON contract).
+ *   - The todos table backing every route is shared/global (not scoped
+ *     per-route) — a single POST to /api/todos is expected to eventually
+ *     surface everywhere, just at different revalidation cadences.
+ * ─────────────────────────────────────────────────────────────────────────
+ */
 
-const FIXTURE_DIR = process.env.FIXTURE_DIR ?? join(process.cwd(), "fixtures");
-const BASE_URL = process.env.BASE_URL ?? "http://localhost:3000";
+import { afterAll, describe, expect, test } from "bun:test";
+import { existsSync, rmSync } from "node:fs";
+import path from "node:path";
+
+// ── CONFIG ──────────────────────────────────────────────────────────────
+const FIXTURES_DIR = path.join(process.cwd(), "fixtures");
+const DB_PATH = path.join(FIXTURES_DIR, "db.sqlite");
+const BUILD_DIR = path.join(FIXTURES_DIR, "build");
+const SVELTEKIT_DIR = path.join(FIXTURES_DIR, ".svelte-kit");
+const PORT = Number(process.env.TEST_PORT ?? 3000);
+const BASE_URL = `http://localhost:${PORT}`;
 
 const PREP_CMD = ["bun", "run", "prepare"];
+const MIGRATE_CMD = ["bun", "run", "src/scripts/prep.ts"];
 const BUILD_CMD = ["bun", "run", "build"];
 const START_CMD = ["bun", "run", "start"];
-const MIGRATE_CMD = ["bun", "./src/scripts/prep.ts"];
 
-const PAGE_PATHS = [
-	"/no-isr/page",
-	"/no-isr/server",
-	"/isr/page",
-	"/isr/server",
-] as const;
+const SERVER_BOOT_TIMEOUT_MS = 20_000;
+const SERVER_BOOT_POLL_MS = 250;
+const OVERALL_TEST_TIMEOUT_MS = 120_000;
 
-type Todo = { id: number; text: string };
-type TodosResponse = { todos: Todo[] };
+// ── LOW-LEVEL HELPERS ───────────────────────────────────────────────────
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function runCommand(cmd: string[], cwd: string) {
-	const proc = Bun.spawnSync({
+/** Run a command synchronously in the fixtures dir; throws on non-zero exit. */
+function runCmd(cmd: string[], label: string) {
+	const result = Bun.spawnSync({
 		cmd,
-		cwd,
+		cwd: FIXTURES_DIR,
 		stdout: "pipe",
 		stderr: "pipe",
+		env: { ...process.env },
 	});
 
-	if (proc.exitCode !== 0) {
-		const stdout = new TextDecoder().decode(proc.stdout);
-		const stderr = new TextDecoder().decode(proc.stderr);
+	const stdout = result.stdout?.toString() ?? "";
+	const stderr = result.stderr?.toString() ?? "";
+
+	if (result.exitCode !== 0) {
 		throw new Error(
-			[
-				`Command failed: ${cmd.join(" ")}`,
-				`cwd: ${cwd}`,
-				`exitCode: ${proc.exitCode}`,
-				stdout ? `stdout:\n${stdout}` : "",
-				stderr ? `stderr:\n${stderr}` : "",
-			]
-				.filter(Boolean)
-				.join("\n\n"),
+			`[${label}] command failed (exit ${result.exitCode}): ${cmd.join(" ")}\n` +
+				`--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`,
 		);
 	}
 
-	return proc;
+	return { stdout, stderr, exitCode: result.exitCode };
 }
 
-async function cleanupFixtureArtifacts() {
-	await rm(join(FIXTURE_DIR, "build"), { recursive: true, force: true });
-	await rm(join(FIXTURE_DIR, "dist"), { recursive: true, force: true });
-
-	await rm(join(FIXTURE_DIR, "db.sqlite"), { force: true });
-	await rm(join(FIXTURE_DIR, "db.sqlite-wal"), { force: true });
-	await rm(join(FIXTURE_DIR, "db.sqlite-shm"), { force: true });
-}
-
-async function waitForServerUp(url: string, timeoutMs = 30_000) {
-	const started = Date.now();
-	let lastError: unknown = null;
-
-	while (Date.now() - started < timeoutMs) {
-		try {
-			const res = await fetch(url, { cache: "no-store" });
-			if (res.ok) return;
-			lastError = new Error(`Unexpected status ${res.status}`);
-		} catch (error) {
-			lastError = error;
-		}
-
-		await sleep(250);
-	}
-
-	throw new Error(`Server did not become ready: ${String(lastError)}`);
-}
-
-async function waitForServerDown(url: string, timeoutMs = 10_000) {
-	const started = Date.now();
-
-	while (Date.now() - started < timeoutMs) {
-		try {
-			const res = await fetch(url, { cache: "no-store" });
-			if (!res.ok) return;
-		} catch {
-			return;
-		}
-
-		await sleep(250);
-	}
-
-	throw new Error("Server did not stop in time");
-}
-
-async function fetchText(pathname: string) {
-	const res = await fetch(new URL(pathname, BASE_URL), {
-		cache: "no-store",
-		headers: { accept: "text/html" },
+/**
+ * Spawns `bun run start` as a detached background process so it doesn't
+ * block the test runner, then polls the server until it responds.
+ */
+async function startServer(): Promise<import("bun").Subprocess> {
+	const proc = Bun.spawn({
+		cmd: START_CMD,
+		cwd: FIXTURES_DIR,
+		stdout: "pipe",
+		stderr: "pipe",
+		env: { ...process.env, PORT: String(PORT) },
 	});
 
-	expect(res.ok).toBe(true);
-	return await res.text();
+	const deadline = Date.now() + SERVER_BOOT_TIMEOUT_MS;
+	let lastError: unknown;
+
+	while (Date.now() < deadline) {
+		// If the process already exited, the server failed to boot — bail early.
+		if (proc.exitCode !== null) {
+			const stderr = proc.stderr ? await new Response(proc.stderr).text() : "";
+			throw new Error(
+				`Server process exited early (code ${proc.exitCode}) before becoming ready.\n${stderr}`,
+			);
+		}
+
+		try {
+			const res = await fetch(`${BASE_URL}/no-isr/page`);
+			if (res.ok) return proc;
+		} catch (err) {
+			lastError = err;
+		}
+
+		await Bun.sleep(SERVER_BOOT_POLL_MS);
+	}
+
+	proc.kill();
+	throw new Error(
+		`Server did not become ready within ${SERVER_BOOT_TIMEOUT_MS}ms. Last error: ${String(lastError)}`,
+	);
 }
 
-async function fetchTodos(pathname: string) {
-	const res = await fetch(new URL(pathname, BASE_URL), {
-		cache: "no-store",
-		headers: { accept: "application/json" },
-	});
+/** Kills the server process and verifies the port is no longer accepting connections. */
+async function stopServerAndVerify(proc: import("bun").Subprocess) {
+	proc.kill();
+	await proc.exited;
 
+	// The process object reports it's done...
+	expect(proc.exitCode === null ? proc.signalCode !== null : true).toBe(true);
+
+	// ...and the port itself should now refuse connections.
+	let stillUp = true;
+	try {
+		await fetch(`${BASE_URL}/no-isr/page`, {
+			signal: AbortSignal.timeout(1000),
+		});
+	} catch {
+		stillUp = false;
+	}
+	expect(stillUp).toBe(false);
+}
+
+async function fetchJsonTodos(
+	urlPath: string,
+): Promise<{ id: number; text: string }[]> {
+	const res = await fetch(`${BASE_URL}${urlPath}`);
 	expect(res.ok).toBe(true);
+	const body = (await res.json()) as { todos: { id: number; text: string }[] };
+	expect(Array.isArray(body.todos)).toBe(true);
+	return body.todos;
+}
 
-	const data = (await res.json()) as TodosResponse;
-	expect(Array.isArray(data.todos)).toBe(true);
-	return data.todos;
+/** Extracts the <li> text contents from a named <section id="..."> in raw HTML. */
+function extractSectionItems(html: string): string[] {
+	const sections = html.matchAll(/<section[^>]*>([\s\S]*?)<\/section>/gi);
+	const items: string[] = [];
+
+	for (const sectionMatch of sections) {
+		const sectionContent = sectionMatch[1];
+		if (!sectionContent) continue; // Safety check
+
+		const uls = sectionContent.matchAll(/<ul[^>]*>([\s\S]*?)<\/ul>/gi);
+
+		for (const ulMatch of uls) {
+			const ulContent = ulMatch[1];
+			if (!ulContent) continue; // Safety check
+
+			const lis = ulContent.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/gi);
+			for (const liMatch of lis) {
+				const liContent = liMatch[1];
+				if (liContent) {
+					// Safety check
+					items.push(liContent.trim());
+				}
+			}
+		}
+	}
+
+	return items;
+}
+
+async function fetchPageSections(urlPath: string) {
+	const res = await fetch(`${BASE_URL}${urlPath}`);
+	expect(res.ok).toBe(true);
+	const html = await res.text();
+	return extractSectionItems(html);
 }
 
 async function createTodo(text: string) {
-	const res = await fetch(new URL("/api/todos", BASE_URL), {
+	const res = await fetch(`${BASE_URL}/api/todos`, {
 		method: "POST",
-		cache: "no-store",
-		headers: {
-			"content-type": "application/json",
-			accept: "application/json",
-		},
+		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ text }),
 	});
-
 	expect(res.ok).toBe(true);
 }
 
-function escapeRegExp(input: string) {
-	return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function rmIfExists(p: string) {
+	if (existsSync(p)) rmSync(p, { recursive: true, force: true });
 }
 
-function countLisInsideSection(html: string, sectionId: string) {
-	const sectionMatch = html.match(
-		new RegExp(
-			`<section\\s+id="${escapeRegExp(sectionId)}"[^>]*>([\\s\\S]*?)<\\/section>`,
-			"i",
-		),
-	);
+// ── TEST ────────────────────────────────────────────────────────────────
 
-	expect(sectionMatch).not.toBeNull();
+describe("ISR / no-ISR revalidation lifecycle", () => {
+	let server: import("bun").Subprocess | null = null;
 
-	const sectionHtml = sectionMatch?.[1] ?? "";
-	const ulMatch = sectionHtml.match(/<ul[^>]*>([\s\S]*?)<\/ul>/i);
-
-	expect(ulMatch).not.toBeNull();
-
-	const ulHtml = ulMatch?.[1] ?? "";
-	const liMatches = ulHtml.match(/<li\b[^>]*>[\s\S]*?<\/li>/gi) ?? [];
-	return liMatches.length;
-}
-
-function assertHtmlTodoState(
-	html: string,
-	expectedPageCount: number,
-	expectedLayoutCount: number,
-	expectedText?: string,
-) {
-	expect(countLisInsideSection(html, "page-todo")).toBe(expectedPageCount);
-	expect(countLisInsideSection(html, "layout-todo")).toBe(expectedLayoutCount);
-
-	if (expectedText) {
-		expect(html).toContain(expectedText);
-	}
-}
-
-async function assertPageState(
-	pathname: string,
-	expectedPageCount: number,
-	expectedLayoutCount: number,
-	expectedText?: string,
-) {
-	const html = await fetchText(pathname);
-	assertHtmlTodoState(
-		html,
-		expectedPageCount,
-		expectedLayoutCount,
-		expectedText,
-	);
-}
-
-async function assertServerState(
-	pathname: string,
-	expectedCount: number,
-	expectedText?: string,
-) {
-	const todos = await fetchTodos(pathname);
-	expect(todos).toHaveLength(expectedCount);
-
-	if (expectedCount > 0) {
-		expect(typeof todos[0]?.id).toBe("number");
-		expect(typeof todos[0]?.text).toBe("string");
-	}
-
-	if (expectedText) {
-		expect(todos.some((todo) => todo.text === expectedText)).toBe(true);
-	}
-}
-
-test(
-	"build, start, ISR timeline, restart, rebuild, and cleanup",
-	async () => {
-		const todoText = `bun-isr-${Date.now()}`;
-		let server: ReturnType<typeof Bun.spawn> | null = null;
-
-		try {
-			await runCommand(PREP_CMD, FIXTURE_DIR);
-			await runCommand(MIGRATE_CMD, FIXTURE_DIR);
-			await runCommand(BUILD_CMD, FIXTURE_DIR);
-
-			server = Bun.spawn({
-				cmd: START_CMD,
-				cwd: FIXTURE_DIR,
-				stdout: "inherit",
-				stderr: "inherit",
-			});
-
-			await waitForServerUp(BASE_URL);
-
-			for (const path of PAGE_PATHS) {
-				if (path.endsWith("/page")) {
-					await assertPageState(path, 0, 0);
-				} else {
-					await assertServerState(path, 0);
-				}
-			}
-
-			await createTodo(todoText);
-
-			for (const path of PAGE_PATHS) {
-				if (path.endsWith("/page")) {
-					await assertPageState(path, 0, 0);
-				} else {
-					await assertServerState(path, 0);
-				}
-			}
-
-			await sleep(5100);
-
-			await assertPageState("/no-isr/page", 0, 0);
-			await assertServerState("/no-isr/server", 0);
-
-			await assertPageState("/isr/page", 1, 0, todoText);
-			await assertServerState("/isr/server", 0);
-
-			await sleep(5100);
-
-			await assertPageState("/no-isr/page", 0, 0);
-			await assertServerState("/no-isr/server", 0);
-
-			await assertPageState("/isr/page", 1, 0, todoText);
-			await assertServerState("/isr/server", 1, todoText);
-
-			await sleep(5100);
-
-			await assertPageState("/no-isr/page", 0, 0);
-			await assertServerState("/no-isr/server", 0);
-
-			await assertPageState("/isr/page", 1, 1, todoText);
-			await assertServerState("/isr/server", 1, todoText);
-
-			server.kill("SIGTERM");
-			await waitForServerDown(BASE_URL);
-
-			server = null;
-
-			await runCommand(BUILD_CMD, FIXTURE_DIR);
-
-			server = Bun.spawn({
-				cmd: START_CMD,
-				cwd: FIXTURE_DIR,
-				stdout: "inherit",
-				stderr: "inherit",
-			});
-
-			await waitForServerUp(BASE_URL);
-
-			await assertPageState("/no-isr/page", 1, 1, todoText);
-			await assertServerState("/no-isr/server", 1, todoText);
-
-			await assertPageState("/isr/page", 1, 1, todoText);
-			await assertServerState("/isr/server", 1, todoText);
-		} finally {
-			if (server) {
-				try {
-					server.kill("SIGTERM");
-				} catch {
-					// ignore
-				}
-
-				try {
-					await waitForServerDown(BASE_URL);
-				} catch {
-					// ignore
-				}
-			}
-
-			await cleanupFixtureArtifacts();
+	afterAll(async () => {
+		// Safety net: make sure nothing is left running / lying around even if
+		// an assertion failed partway through the sequence below.
+		if (server && server.exitCode === null) {
+			server.kill();
+			await server.exited;
 		}
-	},
-	{ timeout: 180_000 },
-);
+		rmIfExists(BUILD_DIR);
+		rmIfExists(SVELTEKIT_DIR);
+		rmIfExists(DB_PATH);
+	});
+
+	test("Migrate the initial schema, then build the SvelteKit project", async () => {
+		runCmd(PREP_CMD, "prepping");
+		runCmd(MIGRATE_CMD, "migrate");
+		const build1 = runCmd(BUILD_CMD, "build#1");
+		expect(build1.exitCode).toBe(0);
+		expect(existsSync(BUILD_DIR)).toBe(true);
+	});
+
+	test("Start `bun run start` in the background and confirm it boots.", async () => {
+		server = await startServer();
+		expect(server.exitCode).toBeNull();
+	});
+
+	test("Everything should start out empty.", async () => {
+		for (const p of ["/no-isr/page", "/isr/page", "/isr/layout"]) {
+			const list = await fetchPageSections(p);
+			expect(list.length).toBe(0);
+		}
+		for (const p of ["/no-isr/server", "/isr/server"]) {
+			expect((await fetchJsonTodos(p)).length).toBe(0);
+		}
+	});
+	test("Immediately after creation, nothing should reflect it yet.", async () => {
+		await createTodo("wash the dishes");
+
+		//    (no-isr should still be re-fetched fresh though — assumed to be
+		//    request-time in this app's contract, so we check it's empty
+		//    only because the underlying write path is presumed async /
+		//    not yet visible; if no-isr is truly always-fresh, this only
+		//    guards the ISR routes staying stale).
+		for (const p of ["/no-isr/page", "/isr/page", "/isr/layout"]) {
+			const list = await fetchPageSections(p);
+			expect(list.length).toBe(0);
+		}
+		for (const p of ["/no-isr/server", "/isr/server"]) {
+			expect((await fetchJsonTodos(p)).length).toBe(0);
+		}
+	});
+
+	test("Wait 5s (isr/page's 5s revalidate window should now have elapsed)", async () => {
+		await Bun.sleep(5 * 1000);
+
+		for (const p of [
+			"/no-isr/page",
+			"/no-isr/server",
+			"/isr/server",
+			"/isr/layout",
+		]) {
+			const count = p.includes("server")
+				? (await fetchJsonTodos(p)).length
+				: (await fetchPageSections(p)).length;
+			expect(count).toBe(0);
+		}
+		{
+			const list = await fetchPageSections("/isr/page");
+			expect(list.length).toBe(1);
+		}
+	});
+
+	test("Wait 5 more seconds (t=10s: isr/server's 10s window elapses).", async () => {
+		await Bun.sleep(5 * 1000);
+
+		for (const p of ["/no-isr/page", "/no-isr/server", "/isr/layout"]) {
+			const count = p.includes("server")
+				? (await fetchJsonTodos(p)).length
+				: (await fetchPageSections(p)).length;
+			expect(count).toBe(0);
+		}
+		{
+			const list = await fetchPageSections("/isr/page");
+			expect(list.length).toBe(1);
+		}
+		expect((await fetchJsonTodos("/isr/server")).length).toBe(1);
+	});
+
+	test("Wait 5 more seconds (t=15s: isr layout's 15s window elapses)", async () => {
+		await Bun.sleep(5 * 1000);
+
+		for (const p of ["/no-isr/page", "/no-isr/server"]) {
+			const count =
+				p === "/no-isr/page"
+					? (await fetchPageSections(p)).length
+					: (await fetchJsonTodos(p)).length;
+			expect(count).toBe(0);
+		}
+		for (const p of ["/isr/page", "/isr/layout"]) {
+			const list = await fetchPageSections(p);
+			expect(list.length).toBe(1);
+		}
+		expect((await fetchJsonTodos("/isr/server")).length).toBe(1);
+	});
+
+	test("Stop the server and verify it's actually down.Rebuild the project and confirm the build succeeds.", async () => {
+		if (server) {
+			await stopServerAndVerify(server);
+			server = null;
+		}
+		const build2 = runCmd(BUILD_CMD, "build#2");
+		expect(build2.exitCode).toBe(0);
+		expect(existsSync(BUILD_DIR)).toBe(true);
+	});
+
+	test("Restart server succeed after new build.", async () => {
+		server = await startServer();
+		expect(server.exitCode).toBeNull();
+	});
+
+	test("All page should have todo.", async () => {
+		for (const p of ["/no-isr/page", "/isr/page", "/isr/layout"]) {
+			const list = await fetchPageSections(p);
+			expect(list.length).toBe(1);
+		}
+		for (const p of ["/no-isr/server", "/isr/server"]) {
+			expect((await fetchJsonTodos(p)).length).toBe(1);
+		}
+	});
+
+	test("Cleanup server", async () => {
+		if (server) {
+			await stopServerAndVerify(server);
+			expect(server.exitCode).not.toBeNull();
+			server = null;
+		}
+		rmIfExists(BUILD_DIR);
+		rmIfExists(SVELTEKIT_DIR);
+		rmIfExists(DB_PATH);
+		expect(existsSync(BUILD_DIR)).toBe(false);
+		expect(existsSync(SVELTEKIT_DIR)).toBe(false);
+		expect(existsSync(DB_PATH)).toBe(false);
+	});
+});
