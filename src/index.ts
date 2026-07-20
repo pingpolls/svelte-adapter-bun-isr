@@ -8,6 +8,25 @@ interface AdapterOptions {
 	port?: number;
 }
 
+/**
+ * Adapter-specific route config. Use it via SvelteKit's own `export const config` page option
+ * in +page.server.ts / +page.ts (or the +layout equivalents to apply it to a whole subtree):
+ *
+ * ```ts
+ * import type { Config } from '@pingpolls/svelte-adapter-bun-isr';
+ *
+ * export const prerender = true;
+ * export const config: Config = { revalidate: 5000 }; // ms
+ * ```
+ *
+ * `revalidate` only has an effect on routes that are also prerendered — the page is built
+ * statically as usual, then the adapter's runtime background worker re-renders it on that
+ * interval and swaps in the fresh HTML.
+ */
+export interface Config {
+	revalidate?: number;
+}
+
 const ADAPTER_NAME = "svelte-adapter-bun-isr";
 
 export default function (options: AdapterOptions = {}): Adapter {
@@ -38,12 +57,28 @@ export default function (options: AdapterOptions = {}): Adapter {
 
 			// 4. Generate route manifest
 			const prerenderedPaths = JSON.stringify(builder.prerendered.paths);
+
+			// Resolve ISR `revalidate` per prerendered path at build time. `builder.routes`
+			// already gives us `config` fully merged across the layout chain (same merge
+			// SvelteKit uses internally for adapter.supports.read), so no need to walk
+			// node modules ourselves at runtime — just match each concrete prerendered
+			// path against its route pattern and pull `config.revalidate` off it.
+			const isrRevalidate: Record<string, number> = {};
+			for (const path of builder.prerendered.paths) {
+				const route = builder.routes.find((r) => r.pattern.test(path));
+				const revalidate = (route?.config as Config | undefined)?.revalidate;
+				if (typeof revalidate === "number" && revalidate > 0) {
+					isrRevalidate[path] = revalidate;
+				}
+			}
+
 			writeFileSync(
 				join(tmp, "manifest.js"),
 				[
 					`export const manifest = ${builder.generateManifest({ relativePath: "./" })};`,
 					`export const prerendered = new Set(${prerenderedPaths});`,
 					`export const base = ${JSON.stringify(builder.config.kit.paths.base)};`,
+					`export const isrRevalidate = ${JSON.stringify(isrRevalidate)};`,
 				].join("\n\n"),
 			);
 
@@ -53,13 +88,11 @@ export default function (options: AdapterOptions = {}): Adapter {
 
 			cpSync(join(tmp, "manifest.js"), join(serverDest, "manifest.js"));
 
-			// Copy server index if it exists
 			const serverIndex = join(tmp, "index.js");
 			if (existsSync(serverIndex)) {
 				cpSync(serverIndex, join(serverDest, "index.js"));
 			}
 
-			// Copy server chunks
 			const serverChunksDir = join(tmp, "chunks");
 			if (existsSync(serverChunksDir)) {
 				const destChunksDir = join(serverDest, "chunks");
@@ -70,19 +103,16 @@ export default function (options: AdapterOptions = {}): Adapter {
 				}
 			}
 
-			// Copy server entries
 			const serverEntriesDir = join(tmp, "entries");
 			if (existsSync(serverEntriesDir)) {
 				await copyDirAsync(serverEntriesDir, join(serverDest, "entries"));
 			}
 
-			// Copy server nodes
 			const serverNodesDir = join(tmp, "nodes");
 			if (existsSync(serverNodesDir)) {
 				await copyDirAsync(serverNodesDir, join(serverDest, "nodes"));
 			}
 
-			// Copy single-file server artifacts
 			const singleFiles = ["env.js", "internal.js", "remote-entry.js"];
 			for (const name of singleFiles) {
 				const src = join(tmp, name);
@@ -91,7 +121,6 @@ export default function (options: AdapterOptions = {}): Adapter {
 				}
 			}
 
-			// Copy .vite manifest if present
 			const viteManifest = join(tmp, ".vite");
 			if (existsSync(viteManifest)) {
 				await copyDirAsync(viteManifest, join(serverDest, ".vite"));
@@ -126,12 +155,11 @@ async function copyDirAsync(src: string, dest: string) {
 function generateServerCode(port: number): string {
 	return `
 import { Server } from './server/index.js';
-import { manifest, prerendered, base } from './server/manifest.js';
+import { manifest, prerendered, base, isrRevalidate } from './server/manifest.js';
 import { Glob } from 'bun';
 import { join } from 'node:path';
 
 const ADAPTER_NAME = 'svelte-adapter-bun-isr';
-const ISR_CACHE = new Map();
 const ASSET_DIR = join(import.meta.dir, 'client', base);
 const PRERENDERED_DIR = join(import.meta.dir, 'prerendered');
 
@@ -142,75 +170,14 @@ await server.init({
   read: (file) => Bun.file(join(ASSET_DIR, file)).stream(),
 });
 
-// Pre-compute: build a Set of all client asset paths for O(1) lookups
-// instead of calling existsSync on every request
+// Pre-compute: O(1) lookup set for static client assets
 const clientAssets = new Set();
 const assetGlob = new Glob('**/*');
 for await (const entry of assetGlob.scan({ cwd: ASSET_DIR, onlyFiles: true, absolute: false })) {
   clientAssets.add('/' + base + '/' + entry);
 }
 
-// Pre-compute: build a Map of regex -> revalidate duration from manifest routes
-// This eliminates per-request route pattern matching and dynamic imports
-const revalidateMap = new Map();
-const routes = manifest._?.routes || [];
-for (const route of routes) {
-  if (!route.pattern) continue;
-  const page = route.page;
-  if (!page) continue;
-
-  let revalidate = null;
-
-  // Check layouts first
-  for (const leafIdx of page.layouts || []) {
-    try {
-      const mod = await manifest._.nodes[leafIdx]();
-      if (mod?.config && typeof mod.config.revalidate === 'number') {
-        revalidate = mod.config.revalidate;
-        break;
-      }
-    } catch {}
-  }
-
-  // Check leaf if no layout had revalidate
-  if (revalidate === null && typeof page.leaf === 'number') {
-    try {
-      const mod = await manifest._.nodes[page.leaf]();
-      if (mod?.config && typeof mod.config.revalidate === 'number') {
-        revalidate = mod.config.revalidate;
-      }
-    } catch {}
-  }
-
-  if (revalidate !== null) {
-    revalidateMap.set(route.pattern, revalidate);
-  }
-}
-
-function getRevalidateForPath(pathname) {
-  for (const [pattern, revalidate] of revalidateMap) {
-    if (pattern.test(pathname)) {
-      return revalidate;
-    }
-  }
-  return null;
-}
-
-function getCached(pathname) {
-  const entry = ISR_CACHE.get(pathname);
-  if (!entry) return null;
-  const age = (Date.now() - entry.timestamp) / 1000;
-  if (age < entry.revalidate) return entry.html;
-  ISR_CACHE.delete(pathname);
-  return null;
-}
-
-function setCache(pathname, html, revalidate) {
-  ISR_CACHE.set(pathname, { html, timestamp: Date.now(), revalidate });
-}
-
-// Pre-compute: build a Map of prerendered page -> pre-opened BunFile
-// for zero-allocation, zero-syscall serving
+// Pre-open BunFile handles for every prerendered path (zero-syscall serving)
 const prerenderedFiles = new Map();
 for (const p of prerendered) {
   const candidates = [
@@ -227,6 +194,37 @@ for (const p of prerendered) {
   }
 }
 
+// In-memory ISR cache: pathname -> latest regenerated HTML.
+// Overrides the build-time static file once the first background regeneration completes.
+// NOTE: resets on process restart (falls back to the build-time file, which is still valid
+// HTML, just up to \`revalidate\` ms stale). Persist to disk here if you need cross-restart freshness.
+const isrCache = new Map();
+const timers = [];
+
+// isrRevalidate is a plain { [path]: revalidateMs } map, fully resolved at build time from
+// each route's \`export const config: Config = { revalidate }\` (merged across the layout
+// chain by SvelteKit itself, see adapter's adapt()). No manifest/node introspection needed here.
+for (const [path, revalidate] of Object.entries(isrRevalidate)) {
+  const regenerate = async () => {
+    try {
+      const request = new Request('http://isr-worker' + path);
+      const response = await server.respond(request, {
+        getClientAddress: () => '127.0.0.1',
+      });
+      if (response.status === 200) {
+        isrCache.set(path, await response.text());
+      } else {
+        console.warn(\`[\${ADAPTER_NAME}] ISR regenerate \${path} -> \${response.status}, keeping stale content\`);
+      }
+    } catch (err) {
+      console.error(\`[\${ADAPTER_NAME}] ISR regenerate failed for \${path}\`, err);
+    }
+  };
+
+  console.log(\`[\${ADAPTER_NAME}] ISR enabled: \${path} (every \${revalidate}ms)\`);
+  timers.push(setInterval(regenerate, revalidate));
+}
+
 const bunServer = Bun.serve({
   port: ${port},
   idleTimeout: 0,
@@ -235,9 +233,9 @@ const bunServer = Bun.serve({
 
   async fetch(request) {
     const url = new URL(request.url);
-    let pathname = url.pathname;
+    const pathname = url.pathname;
 
-    // 1. Serve static client assets (O(1) Set lookup)
+    // 1. Static client assets
     if (clientAssets.has(pathname)) {
       const filePath = join(ASSET_DIR, pathname.slice(base.length + 1) || pathname);
       const file = Bun.file(filePath);
@@ -248,39 +246,33 @@ const bunServer = Bun.serve({
       return new Response(file, { headers });
     }
 
-    // 2. Serve prerendered pages (O(1) Map lookup, pre-opened BunFile)
+    // 2. ISR-regenerated HTML takes priority over the original build-time file
+    const isrHtml = isrCache.get(pathname);
+    if (isrHtml !== undefined) {
+      return new Response(isrHtml, { headers: { 'Content-Type': 'text/html' } });
+    }
+
+    // 3. Prerendered pages (pre-opened BunFile, zero extra syscalls)
     const prerenderedFile = prerenderedFiles.get(pathname);
     if (prerenderedFile) {
-      return new Response(prerenderedFile, {
-        headers: { 'Content-Type': 'text/html' },
-      });
+      return new Response(prerenderedFile, { headers: { 'Content-Type': 'text/html' } });
     }
 
-    // 3. Try ISR cache (O(1) Map lookup)
-    const cached = getCached(pathname);
-    if (cached) {
-      return new Response(cached, { status: 200, headers: { 'Content-Type': 'text/html' } });
-    }
-
-    // 4. Forward to SvelteKit
-    const response = await server.respond(request, {
+    // 4. Everything else: normal dynamic SSR, no caching
+    return server.respond(request, {
       platform: { server: bunServer, request },
+      getClientAddress: () => request.headers.get('x-forwarded-for') ?? '127.0.0.1',
     });
-
-    // 5. Cache 200 responses with revalidate config (pre-computed map)
-    if (response.status === 200) {
-      const revalidate = getRevalidateForPath(pathname);
-      if (revalidate && revalidate > 0) {
-        const clone = response.clone();
-        const html = await clone.text();
-        setCache(pathname, html, revalidate);
-      }
-    }
-
-    return response;
   },
 });
 
 console.log(\`\${ADAPTER_NAME} listening on http://localhost:\${bunServer.port}\`);
+
+const shutdown = () => {
+  for (const t of timers) clearInterval(t);
+  process.exit(0);
+};
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 `;
 }
