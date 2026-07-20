@@ -1,11 +1,41 @@
 import { cpSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { readdir } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import {
+	brotliCompressSync,
+	gzipSync,
+	constants as zlibConstants,
+} from "node:zlib";
 import type { Adapter, Builder } from "@sveltejs/kit";
 
 interface AdapterOptions {
+	/** Output directory for the generated server. Default: 'build' */
 	out?: string;
-	port?: number;
+	/**
+	 * Serve client and prerendered assets from Bun (incl. range requests).
+	 * Set false if a reverse proxy / CDN serves them instead. Default: true
+	 */
+	serveAssets?: boolean;
+	/**
+	 * Emit gzip + brotli (+ zstd if available) variants of assets and
+	 * prerendered pages at build time. Default: true
+	 */
+	precompress?: boolean;
+	/**
+	 * Prefix applied to runtime env vars read by the generated server
+	 * (HOST, PORT, SOCKET_PATH, IDLE_TIMEOUT). Default: ''
+	 */
+	envPrefix?: string;
+	/**
+	 * Build-time default for Bun's idle timeout (seconds). Runtime
+	 * `${envPrefix}IDLE_TIMEOUT` wins if set. Default: 10
+	 */
+	idleTimeout?: number;
+	/**
+	 * Bundle `hooks.server`'s `websocket` export and wire it into
+	 * Bun.serve. Set false for plain HTTP apps. Default: true
+	 */
+	websockets?: boolean;
 }
 
 /**
@@ -32,7 +62,14 @@ export interface Config {
 const ADAPTER_NAME = "@pingpolls/svelte-adapter-bun-isr";
 
 export default function (options: AdapterOptions = {}): Adapter {
-	const { out = "build", port = 3000 } = options;
+	const {
+		out = "build",
+		serveAssets = true,
+		precompress = true,
+		envPrefix = "",
+		idleTimeout = 10,
+		websockets = true,
+	} = options;
 
 	return {
 		name: ADAPTER_NAME,
@@ -52,6 +89,13 @@ export default function (options: AdapterOptions = {}): Adapter {
 			// 2. Copy prerendered pages
 			builder.log.minor("Copying prerendered pages");
 			builder.writePrerendered(join(dest, "prerendered"));
+
+			// 2b. Precompress client + prerendered assets
+			if (precompress) {
+				builder.log.minor("Precompressing assets");
+				await precompressDir(join(dest, "client"));
+				await precompressDir(join(dest, "prerendered"));
+			}
 
 			// 3. Write server code to temp dir
 			builder.log.minor("Building server");
@@ -143,8 +187,49 @@ export default function (options: AdapterOptions = {}): Adapter {
 				await copyDirAsync(viteManifest, join(serverDest, ".vite"));
 			}
 
+			// 5b. Bundle hooks.server's `websocket` export (if any) so the runtime
+			// server can wire it into Bun.serve without us having to reach into
+			// SvelteKit's internal server bundle, which doesn't expose it.
+			let hasWebsocketExport = false;
+			if (websockets) {
+				const hooksSrc = ["src/hooks.server.ts", "src/hooks.server.js"]
+					.map((p) => join(process.cwd(), p))
+					.find((p) => existsSync(p));
+
+				if (hooksSrc) {
+					const source = await readFile(hooksSrc, "utf-8");
+					if (/export\s+(const|function)\s+websocket\b/.test(source)) {
+						builder.log.minor("Bundling hooks.server websocket export");
+						const result = await Bun.build({
+							entrypoints: [hooksSrc],
+							outdir: serverDest,
+							naming: "hooks.js",
+							target: "bun",
+							format: "esm",
+							external: ["$env/*", "$app/*", "$lib/*"],
+						});
+						if (result.success) {
+							hasWebsocketExport = true;
+						} else {
+							builder.log.warn(
+								`[${ADAPTER_NAME}] Failed to bundle hooks.server for websockets, ` +
+									`continuing without websocket support: ${result.logs.join(", ")}`,
+							);
+						}
+					}
+				}
+			}
+
 			// 6. Write the Bun server entry point with ISR caching
-			writeFileSync(join(dest, "index.js"), generateServerCode(port));
+			writeFileSync(
+				join(dest, "index.js"),
+				generateServerCode({
+					serveAssets,
+					envPrefix,
+					idleTimeout,
+					hasWebsocketExport,
+				}),
+			);
 
 			builder.log.minor(`Adapter output written to ${dest}`);
 		},
@@ -169,16 +254,107 @@ async function copyDirAsync(src: string, dest: string) {
 	}
 }
 
-function generateServerCode(port: number): string {
+// Extensions that are already compressed / not worth (re)compressing.
+const SKIP_COMPRESS_EXT = new Set([
+	".gz",
+	".br",
+	".zst",
+	".png",
+	".jpg",
+	".jpeg",
+	".gif",
+	".webp",
+	".avif",
+	".woff",
+	".woff2",
+	".mp4",
+	".mp3",
+	".zip",
+]);
+
+async function precompressDir(dir: string) {
+	if (!existsSync(dir)) return;
+
+	const walk = async (current: string): Promise<void> => {
+		const entries = await readdir(current, { withFileTypes: true });
+		for (const entry of entries) {
+			const fullPath = join(current, entry.name);
+			if (entry.isDirectory()) {
+				await walk(fullPath);
+				continue;
+			}
+
+			const ext = entry.name.slice(entry.name.lastIndexOf(".")).toLowerCase();
+			if (SKIP_COMPRESS_EXT.has(ext)) continue;
+
+			const data = await readFile(fullPath);
+			if (data.byteLength === 0) continue;
+
+			const gz = gzipSync(data, { level: 9 });
+			writeFileSync(`${fullPath}.gz`, gz);
+
+			const br = brotliCompressSync(data, {
+				params: {
+					[zlibConstants.BROTLI_PARAM_QUALITY]:
+						zlibConstants.BROTLI_MAX_QUALITY,
+					[zlibConstants.BROTLI_PARAM_SIZE_HINT]: data.byteLength,
+				},
+			});
+			writeFileSync(`${fullPath}.br`, br);
+
+			// zstd: only available on newer Bun builds. Best-effort.
+			const zstdCompress = (
+				Bun as unknown as { zstdCompressSync?: (b: Buffer) => Buffer }
+			).zstdCompressSync;
+			if (typeof zstdCompress === "function") {
+				try {
+					const zst = zstdCompress(data);
+					writeFileSync(`${fullPath}.zst`, zst);
+				} catch {
+					// ignore — zstd precompression is best-effort
+				}
+			}
+		}
+	};
+
+	await walk(dir);
+}
+
+function generateServerCode(opts: {
+	serveAssets: boolean;
+	envPrefix: string;
+	idleTimeout: number;
+	hasWebsocketExport: boolean;
+}): string {
+	const { serveAssets, envPrefix, idleTimeout, hasWebsocketExport } = opts;
+
 	return `
 import { Server } from './server/index.js';
 import { manifest, prerendered, base, isrRevalidate } from './server/manifest.js';
+${hasWebsocketExport ? "import { websocket } from './server/hooks.js';" : ""}
 import { Glob } from 'bun';
 import { join } from 'node:path';
 
 const ADAPTER_NAME = 'svelte-adapter-bun-isr';
+const ENV_PREFIX = ${JSON.stringify(envPrefix)};
+const DEFAULT_IDLE_TIMEOUT = ${idleTimeout};
+const SERVE_ASSETS = ${JSON.stringify(serveAssets)};
 const ASSET_DIR = join(import.meta.dir, 'client', base);
 const PRERENDERED_DIR = join(import.meta.dir, 'prerendered');
+
+function env(name, fallback) {
+  const value = Bun.env[ENV_PREFIX + name];
+  return value === undefined ? fallback : value;
+}
+
+// --- Runtime binding config ---------------------------------------------
+const HOST = env('HOST', '0.0.0.0');
+const PORT = Number(env('PORT', 3000));
+const SOCKET_PATH = env('SOCKET_PATH', undefined);
+
+const idleTimeoutRaw = env('IDLE_TIMEOUT', undefined);
+const IDLE_TIMEOUT =
+  idleTimeoutRaw === undefined ? DEFAULT_IDLE_TIMEOUT : Number(idleTimeoutRaw);
 
 const server = new Server(manifest);
 
@@ -189,26 +365,49 @@ await server.init({
 
 // Pre-compute: O(1) lookup set for static client assets
 const clientAssets = new Set();
-const assetGlob = new Glob('**/*');
-for await (const entry of assetGlob.scan({ cwd: ASSET_DIR, onlyFiles: true, absolute: false })) {
-  clientAssets.add('/' + base + '/' + entry);
+if (SERVE_ASSETS) {
+  const assetGlob = new Glob('**/*');
+  for await (const entry of assetGlob.scan({ cwd: ASSET_DIR, onlyFiles: true, absolute: false })) {
+    if (entry.endsWith('.gz') || entry.endsWith('.br') || entry.endsWith('.zst')) continue;
+    clientAssets.add('/' + base + '/' + entry);
+  }
 }
 
 // Pre-open BunFile handles for every prerendered path (zero-syscall serving)
 const prerenderedFiles = new Map();
-for (const p of prerendered) {
-  const candidates = [
-    join(PRERENDERED_DIR, p),
-    join(PRERENDERED_DIR, p + '.html'),
-    join(PRERENDERED_DIR, p, 'index.html'),
-  ];
-  for (const filePath of candidates) {
-    const f = Bun.file(filePath);
-    if (await f.exists()) {
-      prerenderedFiles.set(p, f);
-      break;
+if (SERVE_ASSETS) {
+  for (const p of prerendered) {
+    const candidates = [
+      join(PRERENDERED_DIR, p),
+      join(PRERENDERED_DIR, p + '.html'),
+      join(PRERENDERED_DIR, p, 'index.html'),
+    ];
+    for (const filePath of candidates) {
+      const f = Bun.file(filePath);
+      if (await f.exists()) {
+        prerenderedFiles.set(p, f);
+        break;
+      }
     }
   }
+}
+
+// Negotiate best precompressed variant for a file path + Accept-Encoding header.
+// Returns { file, encoding } or null if nothing precompressed is available/accepted.
+async function negotiateCompressed(filePath, acceptEncoding) {
+  if (!acceptEncoding) return null;
+  const accepts = acceptEncoding.toLowerCase();
+  const candidates = [
+    ['br', filePath + '.br'],
+    ['zstd', filePath + '.zst'],
+    ['gzip', filePath + '.gz'],
+  ];
+  for (const [encoding, candidatePath] of candidates) {
+    if (!accepts.includes(encoding)) continue;
+    const f = Bun.file(candidatePath);
+    if (await f.exists()) return { file: f, encoding };
+  }
+  return null;
 }
 
 // In-memory ISR cache: pathname -> latest regenerated HTML.
@@ -243,24 +442,32 @@ for (const [path, revalidate] of Object.entries(isrRevalidate)) {
 }
 
 const bunServer = Bun.serve({
-  port: ${port},
-  idleTimeout: 0,
+  ...(SOCKET_PATH ? { unix: SOCKET_PATH } : { hostname: HOST, port: PORT }),
+  idleTimeout: IDLE_TIMEOUT,
   reusePort: true,
   development: false,
+  ${hasWebsocketExport ? "websocket," : ""}
 
   async fetch(request) {
     const url = new URL(request.url);
     const pathname = url.pathname;
+    const acceptEncoding = request.headers.get('accept-encoding');
 
     // 1. Static client assets
-    if (clientAssets.has(pathname)) {
+    if (SERVE_ASSETS && clientAssets.has(pathname)) {
       const filePath = join(ASSET_DIR, pathname.slice(base.length + 1) || pathname);
-      const file = Bun.file(filePath);
       const headers = {};
       if (pathname.includes('/immutable/')) {
         headers['cache-control'] = 'public,max-age=31536000,immutable';
       }
-      return new Response(file, { headers });
+      headers['vary'] = 'Accept-Encoding';
+
+      const compressed = await negotiateCompressed(filePath, acceptEncoding);
+      if (compressed) {
+        headers['content-encoding'] = compressed.encoding;
+        return new Response(compressed.file, { headers });
+      }
+      return new Response(Bun.file(filePath), { headers });
     }
 
     // 2. ISR-regenerated HTML takes priority over the original build-time file
@@ -270,9 +477,17 @@ const bunServer = Bun.serve({
     }
 
     // 3. Prerendered pages (pre-opened BunFile, zero extra syscalls)
-    const prerenderedFile = prerenderedFiles.get(pathname);
-    if (prerenderedFile) {
-      return new Response(prerenderedFile, { headers: { 'Content-Type': 'text/html' } });
+    if (SERVE_ASSETS) {
+      const prerenderedFile = prerenderedFiles.get(pathname);
+      if (prerenderedFile) {
+        const headers = { 'Content-Type': 'text/html', vary: 'Accept-Encoding' };
+        const compressed = await negotiateCompressed(prerenderedFile.name, acceptEncoding);
+        if (compressed) {
+          headers['content-encoding'] = compressed.encoding;
+          return new Response(compressed.file, { headers });
+        }
+        return new Response(prerenderedFile, { headers });
+      }
     }
 
     // 4. Everything else: normal dynamic SSR, no caching
@@ -283,7 +498,11 @@ const bunServer = Bun.serve({
   },
 });
 
-console.log(\`\${ADAPTER_NAME} listening on http://localhost:\${bunServer.port}\`);
+console.log(
+  SOCKET_PATH
+    ? \`\${ADAPTER_NAME} listening on unix socket \${SOCKET_PATH}\`
+    : \`\${ADAPTER_NAME} listening on http://\${HOST}:\${bunServer.port}\`
+);
 
 const shutdown = () => {
   for (const t of timers) clearInterval(t);

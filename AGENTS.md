@@ -1,109 +1,87 @@
 # AGENTS.md
 
-When executing prompt/tasks, never stop until you fix all the issues, means, all command runs fine, all linter runs fine, all console errors are no more. You are allowed to run swarm mode (delegate to)
+## Project overview
 
-Default to using Bun instead of Node.js.
+This repository contains a SvelteKit adapter for Bun with ISR-style revalidation, asset serving, precompression, and optional websocket wiring.
 
-- Use `bun <file>` instead of `node <file>` or `ts-node <file>`
-- Use `bun test` instead of `jest` or `vitest`
-- Use `bun build <file.html|file.ts|file.css>` instead of `webpack` or `esbuild`
-- Use `bun install` instead of `npm install` or `yarn install` or `pnpm install`
-- Use `bun run <script>` instead of `npm run <script>` or `yarn run <script>` or `pnpm run <script>`
-- Use `bunx <package> <command>` instead of `npx <package> <command>`
-- Bun automatically loads .env, so don't use dotenv.
+## What this code does
 
-## APIs
+- Builds a Bun-compatible SvelteKit server bundle
+- Copies client assets and prerendered pages into the output directory
+- Optionally precompresses assets with gzip, brotli, and best-effort zstd
+- Generates a manifest containing prerendered paths and ISR revalidate values
+- Creates a Bun entry point that serves:
+  - static client assets
+  - ISR-cached HTML
+  - prerendered HTML
+  - dynamic SSR fallback
+- Optionally bundles `hooks.server`'s `websocket` export
 
-- `Bun.serve()` supports WebSockets, HTTPS, and routes. Don't use `express`.
-- `bun:sqlite` for SQLite. Don't use `better-sqlite3`.
-- `Bun.redis` for Redis. Don't use `ioredis`.
-- `Bun.sql` for Postgres. Don't use `pg` or `postgres.js`.
-- `WebSocket` is built-in. Don't use `ws`.
-- Prefer `Bun.file` over `node:fs`'s readFile/writeFile
-- Bun.$`ls` instead of execa.
+## Important behavior
 
-## Testing
+- ISR only works for prerendered routes
+- Routes must use `export const prerender = 'auto'`
+- `export const prerender = true` strips the route from the SSR manifest and breaks runtime regeneration
+- ISR cache is in-memory only and resets on restart
+- `serveAssets` can be disabled when a CDN or reverse proxy handles static files
+- `websockets` should be disabled if the app does not use a `websocket` export
 
-Use `bun test` to run tests.
+## Files to pay attention to
 
-```ts#index.test.ts
-import { test, expect } from "bun:test";
+- `adapter.ts` or the main adapter entry file
+- generated `manifest.js`
+- generated Bun entry point
+- route files that define `config.revalidate`
+- any `src/hooks.server.ts` or `src/hooks.server.js` websocket export
 
-test("hello world", () => {
-  expect(1).toBe(1);
-});
-```
+## Safe edit checklist
 
-## Frontend
+Before changing behavior, verify:
 
-Use HTML imports with `Bun.serve()`. Don't use `vite`. HTML imports fully support React, CSS, Tailwind.
+- output directory structure still matches the generated runtime imports
+- prerendered route paths are still collected correctly
+- route config merges still resolve to the final `revalidate` value
+- compression negotiation still prefers brotli, then zstd, then gzip
+- asset serving still works when `base` is configured
+- websocket bundling still excludes SvelteKit internal virtual modules
+- runtime imports still match the generated file names
 
-Server:
+## Testing ideas
 
-```ts#index.ts
-import index from "./index.html"
+- Build a sample SvelteKit app with prerendered and non-prerendered routes
+- Verify a prerendered route with `revalidate` gets cached and updated
+- Verify a route with `prerender = true` logs the ISR warning
+- Verify static assets are served from the Bun runtime
+- Verify compressed variants are selected when `Accept-Encoding` allows them
+- Verify websocket bundling works only when an export exists
+- Verify the adapter still works when `serveAssets` is disabled
 
-Bun.serve({
-  routes: {
-    "/": index,
-    "/api/users/:id": {
-      GET: (req) => {
-        return new Response(JSON.stringify({ id: req.params.id }));
-      },
-    },
-  },
-  // optional websocket support
-  websocket: {
-    open: (ws) => {
-      ws.send("Hello, world!");
-    },
-    message: (ws, message) => {
-      ws.send(message);
-    },
-    close: (ws) => {
-      // handle close
-    }
-  },
-  development: {
-    hmr: true,
-    console: true,
-  }
-})
-```
+## Implementation notes
 
-HTML files can import .tsx, .jsx or .js files directly and Bun's bundler will transpile & bundle automatically. `<link>` tags can point to stylesheets and Bun's CSS bundler will bundle.
+- The adapter uses `builder.routes` to resolve merged route config
+- The adapter writes a temporary build directory before copying files into the final output
+- The runtime Bun server uses `server.respond()` for SSR and ISR regeneration
+- Compression is done at build time so runtime serving stays simple
 
-```html#index.html
-<html>
-  <body>
-    <h1>Hello, world!</h1>
-    <script type="module" src="./frontend.tsx"></script>
-  </body>
-</html>
-```
+## Style guidance
 
-With the following `frontend.tsx`:
+- Keep route handling deterministic
+- Prefer explicit file checks before copying or reading
+- Keep runtime imports aligned with generated filenames
+- Preserve compatibility with Bun APIs used here
+- Avoid breaking changes to the generated `build/` structure unless necessary
 
-```tsx#frontend.tsx
-import React from "react";
-import { createRoot } from "react-dom/client";
+## When editing
 
-// import .css files directly and it works
-import './index.css';
+If you change any of these, update the README too:
 
-const root = createRoot(document.body);
+- adapter options
+- runtime environment variables
+- generated output structure
+- ISR behavior
+- websocket support
+- compression behavior
 
-export default function Frontend() {
-  return <h1>Hello, world!</h1>;
-}
+## Notes for maintainers
 
-root.render(<Frontend />);
-```
-
-Then, run index.ts
-
-```sh
-bun --hot ./index.ts
-```
-
-For more information, read the Bun API docs in `node_modules/bun-types/docs/**.mdx`.
+This project is intended to stay easy to reason about from a single file adapter implementation. Keep changes small, well documented, and reflected in both the runtime behavior and the README.
