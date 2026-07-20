@@ -1,0 +1,147 @@
+// Folder-specific settings
+//
+// For a full list of overridable settings, and general information on folder-specific settings,
+// see the documentation: https://zed.dev/docs/configuring-zed#settings-files
+// Zed settings
+//
+// For information on how to configure Zed, see the Zed
+// documentation: https://zed.dev/docs/configuring-zed
+//
+// To see all of Zed's default settings without changing your
+// custom settings, run `zed: open default settings` from the
+// command palette (cmd-shift-p / ctrl-shift-p) ->
+// Zed settings
+//
+// For information on how to configure Zed, see the Zed
+// documentation: https://zed.dev/docs/configuring-zed
+//
+{
+	"diff_view_style": "unified",
+	"proxy": "",
+	"agent": {
+		"play_sound_when_agent_done": "always",
+  "tool_permissions": {
+			"tools": {
+				"terminal": {
+					"default": "allow"
+				}
+			}
+		},
+		"profiles": {
+			"plan": {
+				"name": "Plan",
+				"tools": {},
+				"enable_all_context_servers": false,
+				"context_servers": {}
+			}
+		},
+		"default_model": {
+			"provider": "Orbit Pixels",
+			"model": "Ornith 35B",
+			"enable_thinking": false
+		},
+		"favorite_models": [
+			{
+				"provider": "Orbit Pixels OpenAI",
+				"model": "Ornith 35B",
+				"enable_thinking": false
+			}
+		],
+		"model_parameters": []
+	},
+	"session": {
+		"trust_all_worktrees": true
+	},
+	"edit_predictions": {
+		"provider": "open_ai_compatible_api",
+		"open_ai_compatible_api": {
+			"max_output_tokens": 150,
+   "prompt_format": "code_gemma",
+			"model": "Orbit AI Flash",
+			"api_url": "https://llm.orbitpixels.com/v1/completions"
+		}
+	},
+	"language_models": {
+		"anthropic_compatible": {},
+		"openai_compatible": {
+   "Orbit Pixels": {
+    "api_url": "https://llm.orbitpixels.com/v1",
+    "available_models": [
+     {
+      "name": "Orbit AI",
+      "max_tokens": 98304,
+      "max_output_tokens": 98304,
+      "max_completion_tokens": 98304,
+      "reasoning_effort": "low",
+      "capabilities": {
+       "tools": true,
+       "images": true,
+       "parallel_tool_calls": true,
+       "prompt_cache_key": true,
+       "chat_completions": true,
+       "interleaved_reasoning": false,
+       "max_tokens_parameter": true
+      }
+     }
+    ]
+   }
+  }
+	},
+	"formatter": "language_server",
+	"format_on_save": "on",
+	"languages": {
+		"CSS": {
+			"code_actions_on_format": {
+				"source.fixAll.biome": true
+			},
+			"language_servers": [
+				"vscode-css-language-server",
+				"tailwindcss-language-server",
+				"biome"
+			]
+		},
+		"JavaScript": {
+			"code_actions_on_format": {
+				"source.fixAll.biome": true
+			},
+			"language_servers": ["biome", "typescript-language-server", "!vtsls"]
+		},
+		"JSON": {
+			"code_actions_on_format": {
+				"source.fixAll.biome": true
+			},
+			"language_servers": ["biome", "json-language-server"]
+		},
+		"JSONC": {
+			"code_actions_on_format": {
+				"source.fixAll.biome": true
+			},
+			"language_servers": ["biome", "json-language-server"]
+		},
+		"Svelte": {
+			"code_actions_on_format": {
+				"source.fixAll.biome": true
+			},
+			"language_servers": [
+				"svelte-language-server",
+				"tailwindcss-language-server",
+				"biome",
+				"typescript-language-server",
+				"!vtsls",
+				"!eslint"
+			]
+		},
+		"TSX": {
+			"code_actions_on_format": {
+				"source.fixAll.biome": true
+			},
+			"language_servers": ["biome"]
+		},
+		"TypeScript": {
+			"code_actions_on_format": {
+				"source.fixAll.biome": true
+			},
+			"language_servers": ["biome", "typescript-language-server", "!vtsls"]
+		}
+	},
+}

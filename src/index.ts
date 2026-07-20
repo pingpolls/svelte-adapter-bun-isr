@@ -29,7 +29,7 @@ export interface Config {
 	revalidate?: number;
 }
 
-const ADAPTER_NAME = "svelte-adapter-bun-isr";
+const ADAPTER_NAME = "@pingpolls/svelte-adapter-bun-isr";
 
 export default function (options: AdapterOptions = {}): Adapter {
 	const { out = "build", port = 3000 } = options;
