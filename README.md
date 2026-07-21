@@ -8,6 +8,7 @@ A SvelteKit adapter for Bun that supports:
 - Optional precompression at build time
 - Incremental Static Regeneration style revalidation for prerendered routes
 - Optional `hooks.server` websocket export bundling
+- Optional multi-core process clustering via bun's native `reusePort`
 
 ## What this adapter does
 
@@ -16,7 +17,8 @@ This adapter builds a Bun-hosted SvelteKit app with a generated `build/` output 
 - `client/` for client assets
 - `prerendered/` for prerendered pages
 - `server/` for the SvelteKit server bundle and manifest
-- `index.js` as the Bun entry point
+- `app.js` as the actual Bun server (present when `cluster` is enabled)
+- `index.js` as the Bun entry point — either the server directly (`cluster: false`), or a supervisor that spawns `app.js` across worker processes (`cluster: true`, the default)
 
 At runtime, the generated server:
 
@@ -47,7 +49,8 @@ export default defineConfig({
         precompress: true,
         envPrefix: '',
         idleTimeout: 10,
-        websockets: true
+        websockets: true,
+        cluster: true
       }),
 		}),
 	],
@@ -67,7 +70,8 @@ export default {
       precompress: true,
       envPrefix: '',
       idleTimeout: 10,
-      websockets: true
+      websockets: true,
+      cluster: true
     })
   }
 };
@@ -79,6 +83,8 @@ Then build and run:
 bun run build
 bun run build/index.js
 ```
+
+`build/index.js` is always the right entry point regardless of `cluster` — it's either the server itself or the supervisor in front of it.
 
 ## Adapter options
 
@@ -115,6 +121,13 @@ Supported runtime variables:
 - `SOCKET_PATH`
 - `IDLE_TIMEOUT`
 
+When `cluster` is enabled, the supervisor (`index.js`) also reads two runtime variables under the same prefix:
+
+- `CPUS`
+- `BUN_BINARY`
+
+See the `cluster` option below for what they control.
+
 Default: `''`
 
 Example:
@@ -131,6 +144,8 @@ Then the runtime server reads:
 - `APP_PORT`
 - `APP_SOCKET_PATH`
 - `APP_IDLE_TIMEOUT`
+- `APP_CPUS`
+- `APP_BUN_BINARY`
 
 ### `idleTimeout`
 Default idle timeout in seconds for `Bun.serve`.
@@ -138,6 +153,20 @@ Default idle timeout in seconds for `Bun.serve`.
 Runtime env still wins if the prefixed `IDLE_TIMEOUT` is set.
 
 Default: `10`
+
+### `cluster`
+Emit a `build/index.js` supervisor that spawns `build/app.js` across multiple worker processes, each binding the same port with `reusePort: true` (`SO_REUSEPORT`) so the kernel load-balances connections across processes/cores.
+
+Worker count and binary are resolved at runtime, not at build time:
+
+- **Worker count** — `${envPrefix}CPUS` env var if set (must be a positive integer), otherwise `navigator.hardwareConcurrency`, otherwise `os.cpus().length`, otherwise `1`. Resolved on the machine that runs the server, not the machine that built it, so a CI build with fewer cores than production still scales correctly.
+- **Bun binary** — `${envPrefix}BUN_BINARY` env var if set (path or a name resolved via `PATH`), otherwise `process.execPath` (the exact binary the supervisor is currently running under).
+
+If a worker crashes, the supervisor respawns it automatically. `SIGINT`/`SIGTERM` sent to the supervisor are forwarded to all workers for a clean shutdown.
+
+Set this to `false` if something else already manages process count — PM2 `-i max`, k8s replicas/HPA, fly.io machines-per-core, etc. With `cluster: false`, `build/index.js` is the server directly (no `app.js`, no spawning), the same as running a single worker. Running the supervisor *and* an external process manager at the same time multiplies your worker count by both — pick one.
+
+Default: `true`
 
 ### WebSockets
 
@@ -242,6 +271,7 @@ Notes:
 - the cache is in-memory only
 - cache contents reset on process restart
 - stale build-time content still works as fallback
+- under `cluster: true`, each worker process keeps its own independent ISR cache — this is harmless (worst case is duplicated regeneration work across workers) but worth knowing if you need revalidation timing to line up exactly across cores
 
 ## Precompression behavior
 
@@ -298,16 +328,18 @@ build/
     entries/
     nodes/
     .vite/
-  index.js
+  app.js       # only when cluster is enabled — the actual server
+  index.js     # supervisor when cluster is enabled, otherwise the server
 ```
 
 ## Caveats
 
-- ISR cache is memory-only
+- ISR cache is memory-only, and per-process under `cluster: true`
 - ISR depends on prerendered routes being kept in the SSR manifest
 - `prerender = 'auto'` is required for ISR routes
 - precompressed variants are best effort for `zst`
 - if `serveAssets` is disabled, static asset serving is expected elsewhere
+- `cluster: true` and an external process manager both managing worker count will multiply concurrency — use one or the other
 
 ## Development notes
 
@@ -315,6 +347,7 @@ This adapter uses:
 
 - Node.js file system and path helpers
 - Bun build APIs
+- Bun's process spawning APIs for clustering
 - SvelteKit adapter APIs
 - generated manifest metadata for prerendered paths and ISR revalidate mapping
 
