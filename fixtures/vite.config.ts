@@ -7,7 +7,9 @@ export default defineConfig({
 	plugins: [
 		tailwindcss(),
 		sveltekit({
-			adapter: BunISRAdapter(),
+			adapter: BunISRAdapter({
+				precompress: false,
+			}),
 			alias: {
 				$src: "./src",
 			},
