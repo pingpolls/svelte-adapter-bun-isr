@@ -4,7 +4,7 @@
     let { data } = $props();
 </script>
 
-<h1>Id Test</h1>
+<h1>Slug Test</h1>
 
 <p>
     Todo Id: {data.todo.id}

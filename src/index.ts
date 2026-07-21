@@ -414,9 +414,12 @@ function getPrerenderedDiskPath(path) {
 }
 
 const isrInFlight = new Set();
+const MAX_IN_FLIGHT = 100; // Limit concurrent background renders to prevent Promise OOM
+const missingPathsCache = new Map();
+const MAX_MISSING_CACHE = 5000; // Capped negative cache (takes less than 1MB memory)
 
 async function regenerateIsr(path) {
-  if (isrInFlight.has(path)) return false;
+  if (isrInFlight.has(path) || isrInFlight.size >= MAX_IN_FLIGHT) return false;
   isrInFlight.add(path);
   try {
     const request = new Request('http://isr-worker' + path);
@@ -638,9 +641,33 @@ const bunServer = Bun.serve({
       }
     }
 
-    // 3. Block dynamic SSR for unknown paths on ISR routes
+    // 3. Block dynamic SSR for unknown ISR paths (Bounded Negative Caching)
     const route = findRouteForPath(pathname);
     if (route && isrRoutes[route.id]) {
+      const revalidateSec = isrRoutes[route.id]?.revalidate;
+
+      if (revalidateSec !== undefined && revalidateSec !== null) {
+        const now = Date.now();
+        const lastCheck = missingPathsCache.get(pathname);
+
+        // If the path isn't in cache, or the revalidate time window has passed
+        if (!lastCheck || now - lastCheck > revalidateSec * 1000) {
+
+          // OOM Protection: If cache gets too big during a brute-force attack, flush it
+          if (missingPathsCache.size >= MAX_MISSING_CACHE) {
+            missingPathsCache.clear();
+          }
+
+          missingPathsCache.set(pathname, now);
+
+          // Trigger SvelteKit generation in the background.
+          // If the page actually exists now, it will be written to disk for the NEXT request.
+          regenerateIsr(pathname);
+        }
+      }
+
+      // ALWAYS return the static 404 file immediately for this request
+      // This saves CPU and memory from rendering 404s dynamically.
       return get404Response();
     }
 

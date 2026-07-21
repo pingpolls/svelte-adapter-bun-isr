@@ -12,7 +12,7 @@ export const entries: EntryGenerator = () => {
 };
 
 export const load: PageServerLoad = async ({ params: { id } }) => {
-	console.info("Rerunning slug load");
+	console.info("Rerunning id load");
 
 	const numberedId = Number(id);
 
