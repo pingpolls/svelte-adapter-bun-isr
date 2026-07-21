@@ -194,7 +194,7 @@ function rmIfExists(p: string) {
 
 // ── TEST ────────────────────────────────────────────────────────────────
 
-describe("ISR / no-ISR revalidation lifecycle", () => {
+describe("ISR System", () => {
 	let server: import("bun").Subprocess | null = null;
 
 	afterAll(async () => {
@@ -382,7 +382,7 @@ describe("ISR / no-ISR revalidation lifecycle", () => {
 	);
 });
 
-describe("New Features: Bun WebSockets, envPrefix, and Custom Build Folders", () => {
+describe("Websockets, and adapter options", () => {
 	let featServer: import("bun").Subprocess | null = null;
 	const FEAT_PORT = PORT + 1; // Use a distinct port to avoid conflicts
 
