@@ -52,8 +52,9 @@ interface AdapterOptions {
  * `revalidate` only has an effect on routes that are also prerendered. Use
  * `export const prerender = 'auto'`, not `true`: SvelteKit strips fully-prerendered
  * (`true`) routes from the SSR manifest entirely, so there'd be nothing left for the
- * adapter's background worker to re-render at runtime. `'auto'` still produces the static
- * file at build time, but keeps the route reachable via `server.respond()` for regeneration.
+ * adapter's stale-while-revalidate check to re-render at runtime. `'auto'` still produces
+ * the static file at build time, but keeps the route reachable via `server.respond()` for
+ * regeneration.
  */
 export interface Config {
 	revalidate?: number;
@@ -417,35 +418,44 @@ async function negotiateCompressed(filePath, acceptEncoding) {
   return null;
 }
 
-// In-memory ISR cache: pathname -> latest regenerated HTML.
-// Overrides the build-time static file once the first background regeneration completes.
-// NOTE: resets on process restart (falls back to the build-time file, which is still valid
-// HTML, just up to \`revalidate\` s stale). Persist to disk here if you need cross-restart freshness.
+// --- Stale-while-revalidate ISR -----------------------------------------
+// No background interval workers. Freshness is only checked when a request
+// actually hits an ISR-configured path:
+//   - fresh  (age <= revalidate) -> serve cached HTML, do nothing else
+//   - stale  (age >  revalidate) -> serve cached/build-time HTML immediately,
+//                                    fire a background regeneration (unawaited)
+//                                    so the NEXT request gets fresh content
+// isrCache: pathname -> { html, timestamp } — populated lazily on first
+// regeneration. Before that, the build-time prerendered file is served as
+// the initial "stale" baseline. Resets on process restart (falls back to
+// the build-time file again, which is still valid, just possibly stale).
 const isrCache = new Map();
-const timers = [];
+const isrInFlight = new Set(); // paths currently being regenerated, dedupes concurrent triggers
+const serverStartedAt = Date.now();
 
-// isrRevalidate is a plain { [path]: revalidateSec } map, fully resolved at build time from
-// each route's \`export const config: Config = { revalidate }\` (merged across the layout
-// chain by SvelteKit itself, see adapter's adapt()). No manifest/node introspection needed here.
-for (const [path, revalidate] of Object.entries(isrRevalidate)) {
-  const regenerate = async () => {
-    try {
-      const request = new Request('http://isr-worker' + path);
-      const response = await server.respond(request, {
-        getClientAddress: () => '127.0.0.1',
-      });
-      if (response.status === 200) {
-        isrCache.set(path, await response.text());
-      } else {
-        console.warn(\`[\${ADAPTER_NAME}] ISR regenerate \${path} -> \${response.status}, keeping stale content\`);
-      }
-    } catch (err) {
-      console.error(\`[\${ADAPTER_NAME}] ISR regenerate failed for \${path}\`, err);
+async function regenerateIsr(path) {
+  if (isrInFlight.has(path)) return;
+  isrInFlight.add(path);
+  try {
+    const request = new Request('http://isr-worker' + path);
+    const response = await server.respond(request, {
+      getClientAddress: () => '127.0.0.1',
+    });
+    if (response.status === 200) {
+      isrCache.set(path, { html: await response.text(), timestamp: Date.now() });
+    } else {
+      console.warn(\`[\${ADAPTER_NAME}] ISR regenerate \${path} -> \${response.status}, keeping stale content\`);
     }
-  };
+  } catch (err) {
+    console.error(\`[\${ADAPTER_NAME}] ISR regenerate failed for \${path}\`, err);
+  } finally {
+    isrInFlight.delete(path);
+  }
+}
 
-  console.log(\`[\${ADAPTER_NAME}] ISR enabled: \${path} (every \${revalidate}Sec)\`);
-  timers.push(setInterval(regenerate, revalidate * 1000));
+const isrPathCount = Object.keys(isrRevalidate).length;
+if (isrPathCount > 0) {
+  console.log(\`[\${ADAPTER_NAME}] ISR (stale-while-revalidate) enabled for \${isrPathCount} route(s)\`);
 }
 
 const bunServer = Bun.serve({
@@ -477,14 +487,28 @@ const bunServer = Bun.serve({
       return new Response(Bun.file(filePath), { headers });
     }
 
-    // 2. ISR-regenerated HTML takes priority over the original build-time file
-    const isrHtml = isrCache.get(pathname);
-    if (isrHtml !== undefined) {
-      return new Response(isrHtml, { headers: { 'Content-Type': 'text/html' } });
-    }
-
-    // 3. Prerendered pages (pre-opened BunFile, zero extra syscalls)
+    // 2. Prerendered pages, with stale-while-revalidate for ISR-configured routes
     if (SERVE_ASSETS) {
+      const revalidateSec = isrRevalidate[pathname];
+
+      if (revalidateSec !== undefined) {
+        const cached = isrCache.get(pathname);
+        const age = Date.now() - (cached ? cached.timestamp : serverStartedAt);
+        const isStale = age > revalidateSec * 1000;
+
+        if (isStale) {
+          // Fire-and-forget: don't block this response on regeneration.
+          // Next request(s) after this one will pick up the fresh HTML.
+          regenerateIsr(pathname);
+        }
+
+        if (cached) {
+          return new Response(cached.html, { headers: { 'Content-Type': 'text/html' } });
+        }
+        // No regenerated version yet — fall through and serve the build-time
+        // prerendered file below (still correct HTML, just possibly stale).
+      }
+
       const prerenderedFile = prerenderedFiles.get(pathname);
       if (prerenderedFile) {
         const headers = { 'Content-Type': 'text/html', vary: 'Accept-Encoding' };
@@ -497,7 +521,7 @@ const bunServer = Bun.serve({
       }
     }
 
-    // 4. Everything else: normal dynamic SSR, no caching
+    // 3. Everything else: normal dynamic SSR, no caching
     return server.respond(request, {
       platform: { server: bunServer, request },
       getClientAddress: () => request.headers.get('x-forwarded-for') ?? '127.0.0.1',
@@ -512,7 +536,6 @@ console.log(
 );
 
 const shutdown = () => {
-  for (const t of timers) clearInterval(t);
   process.exit(0);
 };
 process.on('SIGTERM', shutdown);

@@ -5,6 +5,25 @@
  * (run from the repo root, or `cd fixtures && bun test tests/isr.e2e.test.ts`)
  *
  * ─────────────────────────────────────────────────────────────────────────
+ * ISR SEMANTICS: stale-while-revalidate, not interval-based background
+ * regeneration. There is no worker ticking on a timer — freshness is only
+ * checked when a request actually hits an ISR-configured path:
+ *
+ *   - age <= revalidate  -> serve cached HTML, nothing else happens.
+ *   - age >  revalidate  -> serve the CURRENT (stale) cached/build-time HTML
+ *                           immediately, and fire an unawaited background
+ *                           regeneration. The refreshed content is only
+ *                           observable on a SUBSEQUENT request, once that
+ *                           background regen resolves.
+ *
+ * Practical effect on this test: once a revalidate window has elapsed, the
+ * *first* request after that point is expected to still return the stale
+ * value (it's also the request that triggers the regen), and a *follow-up*
+ * request is expected to return the fresh value. See `assertSwrTransition`
+ * below — every assertion that crosses a route's revalidate window uses it
+ * instead of a single fetch+expect.
+ * ─────────────────────────────────────────────────────────────────────────
+ *
  * ASSUMPTIONS (the fixtures/package.json + route files were not inspectable
  * from this environment — they were empty/not present). Adjust the CONFIG
  * block below if any of these don't match the real project:
@@ -24,6 +43,10 @@
  *   - The todos table backing every route is shared/global (not scoped
  *     per-route) — a single POST to /api/todos is expected to eventually
  *     surface everywhere, just at different revalidation cadences.
+ *   - `/no-isr/*` routes are prerendered WITHOUT a `revalidate` config
+ *     (frozen at build time, only change after a rebuild) — that's why
+ *     they're expected to stay at 0 for the entire lifetime of the first
+ *     server process, regardless of ISR window checks.
  * ─────────────────────────────────────────────────────────────────────────
  */
 
@@ -46,6 +69,12 @@ const START_CMD = ["bun", "run", "start"];
 const SERVER_BOOT_TIMEOUT_MS = 20_000;
 const SERVER_BOOT_POLL_MS = 250;
 const OVERALL_TEST_TIMEOUT_MS = 120_000;
+
+// SWR background-regen polling defaults. Regeneration is just an in-process
+// server.respond() call against sqlite, so it's normally sub-50ms — this
+// budget is generous headroom, not an expected wait time.
+const SWR_POLL_RETRIES = 10;
+const SWR_POLL_DELAY_MS = 100;
 
 // ── LOW-LEVEL HELPERS ───────────────────────────────────────────────────
 
@@ -192,6 +221,44 @@ function rmIfExists(p: string) {
 	if (existsSync(p)) rmSync(p, { recursive: true, force: true });
 }
 
+/**
+ * Asserts the stale-while-revalidate transition for a single ISR route.
+ *
+ * The FIRST call to `fetcher()` is expected to still return
+ * `expectedStaleCount` — under SWR, crossing the revalidate window doesn't
+ * refresh content synchronously, it only *triggers* a background
+ * regeneration. This first call is that trigger.
+ *
+ * Then it polls `fetcher()` a few more times (short delay between each)
+ * until it sees `expectedFreshCount`, which is what a request AFTER the
+ * background regen resolves should return. Fails if it never arrives
+ * within the retry budget.
+ */
+async function assertSwrTransition(
+	fetcher: () => Promise<number>,
+	expectedStaleCount: number,
+	expectedFreshCount: number,
+	opts: { retries?: number; delayMs?: number } = {},
+) {
+	const { retries = SWR_POLL_RETRIES, delayMs = SWR_POLL_DELAY_MS } = opts;
+
+	// First request: still the pre-revalidate snapshot. Also the request
+	// that fires the background regeneration.
+	const staleCount = await fetcher();
+	expect(staleCount).toBe(expectedStaleCount);
+
+	// Poll subsequent requests until the background regen lands (or we
+	// exhaust the retry budget — in which case the final assertion fails
+	// with the last-seen count, which is the useful failure signal).
+	let freshCount = staleCount;
+	for (let i = 0; i < retries; i++) {
+		await Bun.sleep(delayMs);
+		freshCount = await fetcher();
+		if (freshCount === expectedFreshCount) break;
+	}
+	expect(freshCount).toBe(expectedFreshCount);
+}
+
 // ── TEST ────────────────────────────────────────────────────────────────
 
 describe("ISR System", () => {
@@ -247,11 +314,9 @@ describe("ISR System", () => {
 		async () => {
 			await createTodo("wash the dishes");
 
-			//    (no-isr should still be re-fetched fresh though — assumed to be
-			//    request-time in this app's contract, so we check it's empty
-			//    only because the underlying write path is presumed async /
-			//    not yet visible; if no-isr is truly always-fresh, this only
-			//    guards the ISR routes staying stale).
+			// No route's revalidate window has elapsed yet (t=0), so nothing
+			// is triggered — every fetch here is a plain "still stale" check,
+			// not an SWR transition.
 			for (const p of ["/no-isr/page", "/isr/page", "/isr/layout"]) {
 				const list = await fetchPageSections(p);
 				expect(list.length).toBe(0);
@@ -268,6 +333,8 @@ describe("ISR System", () => {
 		async () => {
 			await Bun.sleep(2 * 1000);
 
+			// Windows that haven't elapsed yet: still fully stale. Nothing
+			// gets triggered by these fetches, so a single check is enough.
 			for (const p of [
 				"/no-isr/page",
 				"/no-isr/server",
@@ -279,10 +346,15 @@ describe("ISR System", () => {
 					: (await fetchPageSections(p)).length;
 				expect(count).toBe(0);
 			}
-			{
-				const list = await fetchPageSections("/isr/page");
-				expect(list.length).toBe(1);
-			}
+
+			// isr/page's 2s window HAS elapsed: first hit returns the stale
+			// (empty) snapshot and kicks off a background regen; a follow-up
+			// hit should pick up the now-fresh content.
+			await assertSwrTransition(
+				async () => (await fetchPageSections("/isr/page")).length,
+				0,
+				1,
+			);
 		},
 		OVERALL_TEST_TIMEOUT_MS,
 	);
@@ -298,11 +370,21 @@ describe("ISR System", () => {
 					: (await fetchPageSections(p)).length;
 				expect(count).toBe(0);
 			}
+
+			// isr/page was already revalidated in the previous step — its own
+			// 2s window may or may not have re-elapsed by now, but the data
+			// hasn't changed since, so a plain fetch is sufficient here.
 			{
 				const list = await fetchPageSections("/isr/page");
 				expect(list.length).toBe(1);
 			}
-			expect((await fetchJsonTodos("/isr/server")).length).toBe(1);
+
+			// isr/server's 4s window HAS elapsed: same stale-then-fresh dance.
+			await assertSwrTransition(
+				async () => (await fetchJsonTodos("/isr/server")).length,
+				0,
+				1,
+			);
 		},
 		OVERALL_TEST_TIMEOUT_MS,
 	);
@@ -319,11 +401,21 @@ describe("ISR System", () => {
 						: (await fetchJsonTodos(p)).length;
 				expect(count).toBe(0);
 			}
-			for (const p of ["/isr/page", "/isr/layout"]) {
-				const list = await fetchPageSections(p);
+
+			// Already revalidated in earlier steps — plain fetches, no SWR
+			// transition expected here.
+			{
+				const list = await fetchPageSections("/isr/page");
 				expect(list.length).toBe(1);
 			}
 			expect((await fetchJsonTodos("/isr/server")).length).toBe(1);
+
+			// isr/layout's 6s window HAS elapsed.
+			await assertSwrTransition(
+				async () => (await fetchPageSections("/isr/layout")).length,
+				0,
+				1,
+			);
 		},
 		OVERALL_TEST_TIMEOUT_MS,
 	);

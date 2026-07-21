@@ -7,6 +7,15 @@
 		"type": "git",
 		"url": "https://github.com/pingpolls/svelte-adapter-bun-isr.git"
 	},
+	"author": {
+		"name": "PingPolls",
+		"url": "https://pingpolls.com"
+	},
+	"contributors": [
+		{
+			"name": "Azvya Erstevan"
+		}
+	],
 	"keywords": [
 		"sveltekit",
 		"adapter",
