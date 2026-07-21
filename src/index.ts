@@ -8,82 +8,81 @@ import {
 } from "node:zlib";
 import type { Adapter, Builder } from "@sveltejs/kit";
 
+/** Options accepted by the adapter factory. */
 interface AdapterOptions {
 	/** Output directory for the generated server. Default: 'build' */
 	out?: string;
-	/**
-	 * Serve client and prerendered assets from Bun (incl. range requests).
-	 * Set false if a reverse proxy / CDN serves them instead. Default: true
-	 */
+	/** Serve client + prerendered assets from Bun (incl. range requests). Default: true */
 	serveAssets?: boolean;
-	/**
-	 * Emit gzip + brotli (+ zstd if available) variants of assets and
-	 * prerendered pages at build time. Default: true
-	 */
+	/** Emit gzip + brotli (+ zstd if available) variants at build time. Default: true */
 	precompress?: boolean;
-	/**
-	 * Prefix applied to runtime env vars read by the generated server
-	 * (HOST, PORT, SOCKET_PATH, IDLE_TIMEOUT, CPUS, BUN_BINARY). Default: ''
-	 */
+	/** Prefix applied to runtime env vars (HOST, PORT, ...). Default: '' */
 	envPrefix?: string;
-	/**
-	 * Build-time default for Bun's idle timeout (seconds). Runtime
-	 * `${envPrefix}IDLE_TIMEOUT` wins if set. Default: 10
-	 */
+	/** Build-time default idle timeout in seconds; runtime env wins. Default: 10 */
 	idleTimeout?: number;
-	/**
-	 * Bundle `hooks.server`'s `websocket` export and wire it into
-	 * Bun.serve. Set false for plain HTTP apps. Default: true
-	 */
+	/** Bundle hooks.server's `websocket` export into Bun.serve. Default: true */
 	websockets?: boolean;
-	/**
-	 * Emit a `build/index.js` supervisor that spawns `build/app.js` across
-	 * multiple worker processes (bound with SO_REUSEPORT) for multi-core
-	 * throughput.
-	 */
+	/** Spawn one worker per core behind SO_REUSEPORT via a supervisor. Default: true */
 	cluster?: boolean;
 }
 
+/** Per-route config read from `export const config = { revalidate }`. */
 export interface Config {
 	revalidate?: number;
 }
 
+/** Result shape returned by the runtime `regenerate()` helper. */
 export interface RegenerateResult {
-	/** Existing prerendered paths whose load function was re-run and file rewritten. */
+	/** Existing prerendered paths that were re-rendered in place. */
 	regenerated: string[];
-	/** Brand-new paths written for the first time (via entries() or a fresh explicit path). */
+	/** Paths written for the first time. */
 	created: string[];
 	/** Paths whose prerendered file (+ compressed variants) were deleted. */
 	removed: string[];
-	/** Anything that didn't work, with a reason. */
+	/** Paths that failed, with a reason. */
 	failed: { path: string; reason: string }[];
 }
 
 const ADAPTER_NAME = "@pingpolls/svelte-adapter-bun-isr";
-const REGISTRY_SYMBOL_KEY = `${ADAPTER_NAME}/registry`;
+const REGISTRY_KEY = `${ADAPTER_NAME}/registry`;
 
+/** File extensions skipped during precompression (already compressed, or negligible gains). */
+const SKIP_COMPRESS_EXT = new Set([
+	".gz",
+	".br",
+	".zst",
+	".png",
+	".jpg",
+	".jpeg",
+	".gif",
+	".webp",
+	".avif",
+	".woff",
+	".woff2",
+	".mp4",
+	".mp3",
+	".zip",
+]);
+
+/**
+ * Trigger an ISR regeneration from inside a running server, e.g. a
+ * `+server.ts` endpoint. Only works while `build/app.js` (or
+ * `build/index.js` with `cluster: false`) is actually running.
+ */
 export function regenerate(
 	paths: string[],
 	removePaths: string[] = [],
 ): Promise<RegenerateResult> {
-	const registry = (
-		globalThis as unknown as Record<
-			string,
-			| { regenerate: (p: string[], r: string[]) => Promise<RegenerateResult> }
-			| undefined
-		>
-	)[REGISTRY_SYMBOL_KEY as unknown as string] as
+	const registry = (globalThis as Record<string, unknown>)[REGISTRY_KEY] as
 		| { regenerate: (p: string[], r: string[]) => Promise<RegenerateResult> }
 		| undefined;
 
 	if (!registry) {
 		throw new Error(
-			`[${ADAPTER_NAME}] regenerate() has no runtime server to talk to. This only works ` +
-				"while build/app.js (or build/index.js with cluster:false) is actually running, " +
-				"called from inside a request — e.g. a +server.ts endpoint.",
+			`[${ADAPTER_NAME}] regenerate() has no runtime server to talk to — ` +
+				"this only works while build/app.js is running, called from inside a request.",
 		);
 	}
-
 	return registry.regenerate(paths, removePaths);
 }
 
@@ -104,45 +103,44 @@ export default function (options: AdapterOptions = {}): Adapter {
 		async adapt(builder: Builder) {
 			const dest = join(process.cwd(), out);
 			const tmp = builder.getBuildDirectory("adapter-bun");
+			const serverDest = join(dest, "server");
 
 			builder.rimraf(dest);
 			builder.rimraf(tmp);
 			mkdirSync(tmp, { recursive: true });
+			mkdirSync(serverDest, { recursive: true });
 
-			// 1. Copy client assets
+			/** 1. Client assets + prerendered pages, optionally precompressed. */
 			builder.log.minor("Copying client assets");
 			builder.writeClient(join(dest, "client"));
-
-			// 2. Copy prerendered pages
-			builder.log.minor("Copying prerendered pages");
 			builder.writePrerendered(join(dest, "prerendered"));
 
-			// 2b. Precompress client + prerendered assets
 			if (precompress) {
 				builder.log.minor("Precompressing assets");
-				await precompressDir(join(dest, "client"));
-				await precompressDir(join(dest, "prerendered"));
+				await Promise.all([
+					precompressDir(join(dest, "client")),
+					precompressDir(join(dest, "prerendered")),
+				]);
 			}
 
-			// 3. Write server code to temp dir
+			/** 2. Server code + ISR route manifest, written straight to serverDest. */
 			builder.log.minor("Building server");
 			builder.writeServer(tmp);
 
-			// 4. Generate route manifest
 			const isrRoutes: Record<string, { revalidate: number | null }> = {};
-
 			for (const route of builder.routes) {
 				if (route.prerender !== "auto") continue;
-
 				const revalidate = (route.config as Config | undefined)?.revalidate;
-				const normalizedRevalidate =
-					typeof revalidate === "number" && revalidate > 0 ? revalidate : null;
-
-				isrRoutes[route.id] = { revalidate: normalizedRevalidate };
+				isrRoutes[route.id] = {
+					revalidate:
+						typeof revalidate === "number" && revalidate > 0
+							? revalidate
+							: null,
+				};
 			}
 
 			writeFileSync(
-				join(tmp, "manifest.js"),
+				join(serverDest, "manifest.js"),
 				[
 					`export const manifest = ${builder.generateManifest({ relativePath: "./" })};`,
 					`export const base = ${JSON.stringify(builder.config.kit.paths.base)};`,
@@ -150,82 +148,26 @@ export default function (options: AdapterOptions = {}): Adapter {
 				].join("\n\n"),
 			);
 
-			// 5. Copy server artifacts to dest
-			const serverDest = join(dest, "server");
-			mkdirSync(serverDest, { recursive: true });
-
-			cpSync(join(tmp, "manifest.js"), join(serverDest, "manifest.js"));
-
-			const serverIndex = join(tmp, "index.js");
-			if (existsSync(serverIndex)) {
-				cpSync(serverIndex, join(serverDest, "index.js"));
+			/** 3. Copy the rest of the built server verbatim (single files, then dirs). */
+			for (const file of [
+				"index.js",
+				"env.js",
+				"internal.js",
+				"remote-entry.js",
+			]) {
+				const src = join(tmp, file);
+				if (existsSync(src)) cpSync(src, join(serverDest, file));
+			}
+			for (const dir of ["chunks", "entries", "nodes", ".vite"]) {
+				const src = join(tmp, dir);
+				if (existsSync(src)) await copyDir(src, join(serverDest, dir));
 			}
 
-			const serverChunksDir = join(tmp, "chunks");
-			if (existsSync(serverChunksDir)) {
-				const destChunksDir = join(serverDest, "chunks");
-				mkdirSync(destChunksDir, { recursive: true });
-				const chunks = await readdir(serverChunksDir);
-				for (const chunk of chunks) {
-					cpSync(join(serverChunksDir, chunk), join(destChunksDir, chunk));
-				}
-			}
+			/** 4. Bundle hooks.server's `websocket` export, if present. */
+			const hasWebsocketExport =
+				websockets && (await bundleWebsocketHooks(builder, serverDest));
 
-			const serverEntriesDir = join(tmp, "entries");
-			if (existsSync(serverEntriesDir)) {
-				await copyDirAsync(serverEntriesDir, join(serverDest, "entries"));
-			}
-
-			const serverNodesDir = join(tmp, "nodes");
-			if (existsSync(serverNodesDir)) {
-				await copyDirAsync(serverNodesDir, join(serverDest, "nodes"));
-			}
-
-			const singleFiles = ["env.js", "internal.js", "remote-entry.js"];
-			for (const name of singleFiles) {
-				const src = join(tmp, name);
-				if (existsSync(src)) {
-					cpSync(src, join(serverDest, name));
-				}
-			}
-
-			const viteManifest = join(tmp, ".vite");
-			if (existsSync(viteManifest)) {
-				await copyDirAsync(viteManifest, join(serverDest, ".vite"));
-			}
-
-			// 5b. Bundle hooks.server's websocket export if present
-			let hasWebsocketExport = false;
-			if (websockets) {
-				const hooksSrc = ["src/hooks.server.ts", "src/hooks.server.js"]
-					.map((p) => join(process.cwd(), p))
-					.find((p) => existsSync(p));
-
-				if (hooksSrc) {
-					const source = await readFile(hooksSrc, "utf-8");
-					if (/export\s+(const|function)\s+websocket\b/.test(source)) {
-						builder.log.minor("Bundling hooks.server websocket export");
-						const result = await Bun.build({
-							entrypoints: [hooksSrc],
-							outdir: serverDest,
-							naming: "hooks.js",
-							target: "bun",
-							format: "esm",
-							external: ["$env/*", "$app/*"],
-						});
-						if (result.success) {
-							hasWebsocketExport = true;
-						} else {
-							builder.log.warn(
-								`[${ADAPTER_NAME}] Failed to bundle hooks.server for websockets, ` +
-									`continuing without websocket support: ${result.logs.join(", ")}`,
-							);
-						}
-					}
-				}
-			}
-
-			// 6. Write Bun server entry point
+			/** 5. Write the Bun entry point(s). */
 			const serverFileName = cluster ? "app.js" : "index.js";
 			writeFileSync(
 				join(dest, serverFileName),
@@ -236,7 +178,6 @@ export default function (options: AdapterOptions = {}): Adapter {
 					hasWebsocketExport,
 				}),
 			);
-
 			if (cluster) {
 				writeFileSync(
 					join(dest, "index.js"),
@@ -253,84 +194,96 @@ export default function (options: AdapterOptions = {}): Adapter {
 	};
 }
 
-async function copyDirAsync(src: string, dest: string) {
+/** Recursively copy a directory; siblings copy in parallel. */
+async function copyDir(src: string, dest: string): Promise<void> {
 	mkdirSync(dest, { recursive: true });
 	const entries = await readdir(src, { withFileTypes: true });
-	for (const entry of entries) {
-		const srcPath = join(src, entry.name);
-		const destPath = join(dest, entry.name);
-		if (entry.isDirectory()) {
-			await copyDirAsync(srcPath, destPath);
-		} else {
-			cpSync(srcPath, destPath);
-		}
-	}
+	await Promise.all(
+		entries.map((entry) => {
+			const from = join(src, entry.name);
+			const to = join(dest, entry.name);
+			if (entry.isDirectory()) return copyDir(from, to);
+			cpSync(from, to);
+			return undefined;
+		}),
+	);
 }
 
-const SKIP_COMPRESS_EXT = new Set([
-	".gz",
-	".br",
-	".zst",
-	".png",
-	".jpg",
-	".jpeg",
-	".gif",
-	".webp",
-	".avif",
-	".woff",
-	".woff2",
-	".mp4",
-	".mp3",
-	".zip",
-]);
-
-async function precompressDir(dir: string) {
+/** Gzip + Brotli (+ Zstd if the Bun build supports it) every compressible file in a tree. */
+async function precompressDir(dir: string): Promise<void> {
 	if (!existsSync(dir)) return;
 
-	const walk = async (current: string): Promise<void> => {
-		const entries = await readdir(current, { withFileTypes: true });
-		for (const entry of entries) {
-			const fullPath = join(current, entry.name);
-			if (entry.isDirectory()) {
-				await walk(fullPath);
-				continue;
-			}
+	const entries = await readdir(dir, { withFileTypes: true });
+	await Promise.all(
+		entries.map(async (entry) => {
+			const fullPath = join(dir, entry.name);
+			if (entry.isDirectory()) return precompressDir(fullPath);
 
 			const ext = entry.name.slice(entry.name.lastIndexOf(".")).toLowerCase();
-			if (SKIP_COMPRESS_EXT.has(ext)) continue;
+			if (SKIP_COMPRESS_EXT.has(ext)) return;
 
 			const data = await readFile(fullPath);
-			if (data.byteLength === 0) continue;
+			if (data.byteLength === 0) return;
 
-			const gz = gzipSync(data, { level: 9 });
-			writeFileSync(`${fullPath}.gz`, gz);
-
-			const br = brotliCompressSync(data, {
-				params: {
-					[zlibConstants.BROTLI_PARAM_QUALITY]:
-						zlibConstants.BROTLI_MAX_QUALITY,
-					[zlibConstants.BROTLI_PARAM_SIZE_HINT]: data.byteLength,
-				},
-			});
-			writeFileSync(`${fullPath}.br`, br);
+			writeFileSync(`${fullPath}.gz`, gzipSync(data, { level: 9 }));
+			writeFileSync(
+				`${fullPath}.br`,
+				brotliCompressSync(data, {
+					params: {
+						[zlibConstants.BROTLI_PARAM_QUALITY]:
+							zlibConstants.BROTLI_MAX_QUALITY,
+						[zlibConstants.BROTLI_PARAM_SIZE_HINT]: data.byteLength,
+					},
+				}),
+			);
 
 			const zstdCompress = (
 				Bun as unknown as { zstdCompressSync?: (b: Buffer) => Buffer }
 			).zstdCompressSync;
 			if (typeof zstdCompress === "function") {
 				try {
-					const zst = zstdCompress(data);
-					writeFileSync(`${fullPath}.zst`, zst);
+					writeFileSync(`${fullPath}.zst`, zstdCompress(data));
 				} catch {
-					// ignore
+					/** zstd unsupported on this platform — skip silently */
 				}
 			}
-		}
-	};
-
-	await walk(dir);
+		}),
+	);
 }
 
+/** Bundle `hooks.server`'s `websocket` export for Bun.serve, if the app defines one. */
+async function bundleWebsocketHooks(
+	builder: Builder,
+	serverDest: string,
+): Promise<boolean> {
+	const hooksSrc = ["src/hooks.server.ts", "src/hooks.server.js"]
+		.map((p) => join(process.cwd(), p))
+		.find(existsSync);
+	if (!hooksSrc) return false;
+
+	const source = await readFile(hooksSrc, "utf-8");
+	if (!/export\s+(const|function)\s+websocket\b/.test(source)) return false;
+
+	builder.log.minor("Bundling hooks.server websocket export");
+	const result = await Bun.build({
+		entrypoints: [hooksSrc],
+		outdir: serverDest,
+		naming: "hooks.js",
+		target: "bun",
+		format: "esm",
+		external: ["$env/*", "$app/*"],
+	});
+
+	if (!result.success) {
+		builder.log.warn(
+			`[${ADAPTER_NAME}] Failed to bundle hooks.server for websockets, continuing without: ${result.logs.join(", ")}`,
+		);
+		return false;
+	}
+	return true;
+}
+
+/** Generates the Bun HTTP server (`app.js` or `index.js` when `cluster: false`). */
 function generateServerCode(opts: {
 	serveAssets: boolean;
 	envPrefix: string;
@@ -343,8 +296,9 @@ function generateServerCode(opts: {
 import { Server } from './server/index.js';
 import { manifest, base, isrRoutes } from './server/manifest.js';
 ${hasWebsocketExport ? "import { websocket } from './server/hooks.js';" : ""}
+import { existsSync } from 'node:fs';
+import { readdir, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
-import { stat, unlink } from 'node:fs/promises';
 
 const ADAPTER_NAME = 'svelte-adapter-bun-isr';
 const REGISTRY_KEY = ${JSON.stringify(`${ADAPTER_NAME}/registry`)};
@@ -354,6 +308,7 @@ const SERVE_ASSETS = ${JSON.stringify(serveAssets)};
 const ASSET_DIR = join(import.meta.dir, 'client', base);
 const PRERENDERED_DIR = join(import.meta.dir, 'prerendered');
 
+/** Read a runtime env var under ENV_PREFIX, falling back to a default. */
 function env(name, fallback) {
   const value = Bun.env[ENV_PREFIX + name];
   return value === undefined ? fallback : value;
@@ -362,42 +317,31 @@ function env(name, fallback) {
 const HOST = env('HOST', '0.0.0.0');
 const PORT = Number(env('PORT', 3000));
 const SOCKET_PATH = env('SOCKET_PATH', undefined);
-
 const idleTimeoutRaw = env('IDLE_TIMEOUT', undefined);
-const IDLE_TIMEOUT =
-  idleTimeoutRaw === undefined ? DEFAULT_IDLE_TIMEOUT : Number(idleTimeoutRaw);
+const IDLE_TIMEOUT = idleTimeoutRaw === undefined ? DEFAULT_IDLE_TIMEOUT : Number(idleTimeoutRaw);
 
 const server = new Server(manifest);
-
-// Precompute route order once: static > matched params > plain params
-// > rest params. Lookups then stay a simple linear find with no
-// per-request sorting or recursion.
-const sortedRoutes = [...manifest._.routes].sort(compareRouteSpecificity);
-
 await server.init({
   env: Bun.env,
   read: (file) => Bun.file(join(ASSET_DIR, file)).stream(),
 });
 
-async function negotiateCompressed(filePath, acceptEncoding) {
-  if (!acceptEncoding) return null;
-  const accepts = acceptEncoding.toLowerCase();
-  const candidates = [
-    ['br', filePath + '.br'],
-    ['zstd', filePath + '.zst'],
-    ['gzip', filePath + '.gz'],
-  ];
-  for (const [encoding, candidatePath] of candidates) {
-    if (!accepts.includes(encoding)) continue;
-    const f = Bun.file(candidatePath);
-    if (await f.exists()) return { file: f, encoding };
-  }
-  return null;
+/**
+ * Route lookup, split for speed:
+ *  - static routes (no bracket segments) live in a Map -> O(1) lookup.
+ *  - dynamic routes are pattern-tested in specificity order (static > matched
+ *    param > plain param > rest param), preserving SvelteKit's routing
+ *    priority. Only the (typically small) dynamic subset is ever scanned.
+ */
+const routesById = new Map(manifest._.routes.map((r) => [r.id, r]));
+const staticRoutes = new Map();
+const dynamicRoutes = [];
+for (const route of manifest._.routes) {
+  if (route.id.includes('[')) dynamicRoutes.push(route);
+  else staticRoutes.set(route.id, route);
 }
+dynamicRoutes.sort(compareRouteSpecificity);
 
-// Lower weight = more specific. Static segments always win over
-// dynamic ones; matched params ([x=matcher]) beat plain params ([x]);
-// rest params ([...x]) are least specific.
 function segmentWeight(seg) {
   if (seg.startsWith('[...')) return 3;
   if (seg.startsWith('[') && seg.includes('=')) return 1;
@@ -410,61 +354,93 @@ function compareRouteSpecificity(a, b) {
   const bs = b.id.split('/');
   const len = Math.min(as.length, bs.length);
   for (let i = 0; i < len; i++) {
-    const wa = segmentWeight(as[i]);
-    const wb = segmentWeight(bs[i]);
-    if (wa !== wb) return wa - wb;
+    const diff = segmentWeight(as[i]) - segmentWeight(bs[i]);
+    if (diff !== 0) return diff;
   }
   return as.length - bs.length;
 }
 
-function findRouteForPath(path) {
-  return sortedRoutes.find((r) => r.pattern.test(path));
+function findRouteForPath(pathname) {
+  return staticRoutes.get(pathname) ?? dynamicRoutes.find((r) => r.pattern.test(pathname));
 }
-// Zero-memory cluster-safe file resolver
-async function getPrerenderedFilePath(path) {
-  const normalized = path === '/' || path === '' ? '/index' : path;
-  const candidates = [
-    join(PRERENDERED_DIR, normalized + '.html'),
-    join(PRERENDERED_DIR, path, 'index.html'),
-    join(PRERENDERED_DIR, path),
-  ];
-  for (const candidate of candidates) {
-    if (await Bun.file(candidate).exists()) return candidate;
+
+/**
+ * In-memory index of prerendered files: pathname -> { file, type }.
+ * Built once at boot by walking PRERENDERED_DIR, then kept in sync by
+ * regenerateIsr()/remove() so lookups never touch the filesystem.
+ *
+ * Not every ISR route is HTML — a prerendered \`+server.ts\` (JSON, CSV,
+ * etc.) can land here too, extensionless or with its own extension, so
+ * files are indexed regardless of suffix and their real content-type is
+ * read from disk once at boot rather than guessed per request.
+ */
+const prerendered = new Map();
+
+async function indexPrerendered(dir, routeBase) {
+  if (!existsSync(dir)) return;
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const abs = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      await indexPrerendered(abs, \`\${routeBase}/\${entry.name}\`);
+      continue;
+    }
+    const dot = entry.name.lastIndexOf('.');
+    const isHtmlIndex = entry.name === 'index.html';
+    const route = isHtmlIndex
+      ? routeBase || '/'
+      : \`\${routeBase}/\${dot > 0 && entry.name.endsWith('.html') ? entry.name.slice(0, dot) : entry.name}\`;
+    prerendered.set(route, { file: abs, type: Bun.file(abs).type });
+  }
+}
+await indexPrerendered(PRERENDERED_DIR, '');
+
+/**
+ * Disk path for a path with no prerendered entry yet (first-ever
+ * regenerate of a route SvelteKit never wrote at build time). Keeps the
+ * path's own extension if it has one (e.g. '/lala.csv'), otherwise
+ * defaults to '.html'.
+ */
+function prerenderedDiskPath(path) {
+  if (path === '/') return join(PRERENDERED_DIR, 'index.html');
+  const last = path.slice(path.lastIndexOf('/') + 1);
+  const hasExt = last.includes('.');
+  return join(PRERENDERED_DIR, hasExt ? path : path + '.html');
+}
+
+/** Pick the best available precompressed variant for a file, if any. */
+async function negotiateCompressed(filePath, acceptEncoding) {
+  if (!acceptEncoding) return null;
+  const accepts = acceptEncoding.toLowerCase();
+  for (const [encoding, ext] of [['br', '.br'], ['zstd', '.zst'], ['gzip', '.gz']]) {
+    if (!accepts.includes(encoding)) continue;
+    const file = Bun.file(filePath + ext);
+    if (await file.exists()) return { file, encoding };
   }
   return null;
 }
 
-function getPrerenderedDiskPath(path) {
-  if (path === '/' || path === '') return join(PRERENDERED_DIR, 'index.html');
-  return join(PRERENDERED_DIR, path + '.html');
-}
-
 const isrInFlight = new Set();
-const MAX_IN_FLIGHT = 100; // Limit concurrent background renders to prevent Promise OOM
+const MAX_IN_FLIGHT = 100; // caps concurrent background renders
 const missingPathsCache = new Map();
-const MAX_MISSING_CACHE = 5000; // Capped negative cache (takes less than 1MB memory)
+const MAX_MISSING_CACHE = 5000; // bounded negative cache (~1MB worst case)
 
+/** Re-render one path via SSR and overwrite its prerendered file + index entry. */
 async function regenerateIsr(path) {
   if (isrInFlight.has(path) || isrInFlight.size >= MAX_IN_FLIGHT) return false;
   isrInFlight.add(path);
   try {
     const request = new Request('http://isr-worker' + path);
-    const response = await server.respond(request, {
-      getClientAddress: () => '127.0.0.1',
-    });
-    if (response.status === 200) {
-      const existingPath = await getPrerenderedFilePath(path);
-      const filePath = existingPath || getPrerenderedDiskPath(path);
-
-      await Bun.write(filePath, await response.arrayBuffer());
-
-      for (const ext of ['.br', '.gz', '.zst']) {
-        await unlink(filePath + ext).catch(() => {});
-      }
-      return true;
+    const response = await server.respond(request, { getClientAddress: () => '127.0.0.1' });
+    if (response.status !== 200) {
+      console.warn(\`[\${ADAPTER_NAME}] regenerate \${path} -> \${response.status}, keeping existing content\`);
+      return false;
     }
-    console.warn(\`[\${ADAPTER_NAME}] regenerate \${path} -> \${response.status}, keeping existing content\`);
-    return false;
+    const filePath = prerendered.get(path)?.file ?? prerenderedDiskPath(path);
+    const type = response.headers.get('content-type') || Bun.file(filePath).type;
+    await Bun.write(filePath, await response.arrayBuffer());
+    await Promise.all(['.br', '.gz', '.zst'].map((ext) => unlink(filePath + ext).catch(() => {})));
+    prerendered.set(path, { file: filePath, type });
+    return true;
   } catch (err) {
     console.error(\`[\${ADAPTER_NAME}] regenerate failed for \${path}\`, err);
     return false;
@@ -473,57 +449,46 @@ async function regenerateIsr(path) {
   }
 }
 
+/** Expand a dynamic route id's entries() into concrete paths, e.g. '/blog/[slug]' -> '/blog/foo'. */
+async function expandEntries(routeId) {
+  const route = routesById.get(routeId);
+  const nodeIndex = route?.page?.leaf;
+  if (nodeIndex === undefined) return null;
+  const node = await manifest._.nodes[nodeIndex]();
+  const entriesFn = node?.server?.entries ?? node?.universal?.entries;
+  if (typeof entriesFn !== 'function') return [];
+  const paramSets = (await entriesFn()) || [];
+  return paramSets.map((params) =>
+    routeId.replace(/\\[(\\.\\.\\.)?([^\\]]+)\\]/g, (_m, _rest, name) => String(params[name] ?? '')),
+  );
+}
+
+async function regenerateOne(path, result) {
+  const existed = prerendered.has(path);
+  const ok = await regenerateIsr(path);
+  if (ok) result[existed ? 'regenerated' : 'created'].push(path);
+  else result.failed.push({ path, reason: 'render failed' });
+}
+
 async function regenerateImpl(paths, removePaths) {
   const result = { regenerated: [], created: [], removed: [], failed: [] };
 
   for (const entry of paths) {
     if (entry.includes('[')) {
-      const routeCfg = isrRoutes[entry];
-      if (!routeCfg) {
+      if (!isrRoutes[entry]) {
         result.failed.push({ path: entry, reason: 'not an ISR-enabled route (prerender must be auto)' });
         continue;
       }
-      const route = manifest._.routes.find((r) => r.id === entry);
-      if (!route) {
-        result.failed.push({ path: entry, reason: 'route not found in runtime manifest' });
-        continue;
-      }
-
-      const nodeIndex = route.page && typeof route.page.leaf === 'number' ? route.page.leaf : undefined;
-      if (nodeIndex === undefined) {
+      const concretePaths = await expandEntries(entry).catch((err) => {
+        result.failed.push({ path: entry, reason: 'entries/regeneration threw: ' + String(err) });
+        return null;
+      });
+      if (concretePaths === null) continue;
+      if (concretePaths.length === 0) {
         result.failed.push({ path: entry, reason: 'no +page node with entries for this route id' });
         continue;
       }
-
-      try {
-        const node = await manifest._.nodes[nodeIndex]();
-        const entriesFn = node?.server?.entries ?? node?.universal?.entries;
-
-        let paramSets = [];
-        if (typeof entriesFn === 'function') {
-          paramSets = (await entriesFn()) || [];
-        }
-
-        if (!paramSets || paramSets.length === 0) {
-          continue;
-        }
-
-        for (const params of paramSets) {
-          const concretePath = entry.replace(/\\[(\\.\\.\\.)?([^\\]]+)\\]/g, (_m, _rest, name) => {
-            const value = params[name];
-            return value === undefined ? '' : String(value);
-          });
-          const existingPath = await getPrerenderedFilePath(concretePath);
-          const ok = await regenerateIsr(concretePath);
-          if (ok) {
-            result[existingPath ? 'regenerated' : 'created'].push(concretePath);
-          } else {
-            result.failed.push({ path: concretePath, reason: 'render failed' });
-          }
-        }
-      } catch (err) {
-        result.failed.push({ path: entry, reason: 'entries/regeneration threw: ' + String(err) });
-      }
+      await Promise.all(concretePaths.map((p) => regenerateOne(p, result)));
       continue;
     }
 
@@ -532,32 +497,30 @@ async function regenerateImpl(paths, removePaths) {
       result.failed.push({ path: entry, reason: 'route is not ISR-enabled (prerender must be auto)' });
       continue;
     }
-
-    const existingPath = await getPrerenderedFilePath(entry);
-    const ok = await regenerateIsr(entry);
-    if (ok) {
-      result[existingPath ? 'regenerated' : 'created'].push(entry);
-    } else {
-      result.failed.push({ path: entry, reason: 'render failed' });
-    }
+    await regenerateOne(entry, result);
   }
 
-  for (const path of removePaths) {
-    const filePath = await getPrerenderedFilePath(path);
-    if (!filePath) {
-      result.failed.push({ path, reason: 'not a tracked prerendered path' });
-      continue;
-    }
-    try {
-      await unlink(filePath).catch(() => {});
-      for (const ext of ['.br', '.gz', '.zst']) {
-        await unlink(filePath + ext).catch(() => {});
+  await Promise.all(
+    removePaths.map(async (path) => {
+      const entry = prerendered.get(path);
+      if (!entry) {
+        result.failed.push({ path, reason: 'not a tracked prerendered path' });
+        return;
       }
-      result.removed.push(path);
-    } catch (err) {
-      result.failed.push({ path, reason: String(err) });
-    }
-  }
+      const filePath = entry.file;
+      try {
+        await Promise.all(
+          [filePath, filePath + '.br', filePath + '.gz', filePath + '.zst'].map((f) =>
+            unlink(f).catch(() => {}),
+          ),
+        );
+        prerendered.delete(path);
+        result.removed.push(path);
+      } catch (err) {
+        result.failed.push({ path, reason: String(err) });
+      }
+    }),
+  );
 
   return result;
 }
@@ -570,28 +533,20 @@ if (isrRouteCount > 0 && (workerIndex === undefined || workerIndex === '0')) {
   console.log(\`[\${ADAPTER_NAME}] ISR enabled for \${isrRouteCount} route pattern(s), serving from \${PRERENDERED_DIR}\`);
 }
 
+/** Serve (and lazily cache) the static 404 page for ISR-blocked paths. */
 async function get404Response() {
   const fallback404Path = join(PRERENDERED_DIR, '404.html');
   const fallbackFile = Bun.file(fallback404Path);
-
   if (await fallbackFile.exists()) {
-    return new Response(fallbackFile, {
-      status: 404,
-      headers: { 'content-type': 'text/html; charset=utf-8' },
-    });
+    return new Response(fallbackFile, { status: 404, headers: { 'content-type': 'text/html; charset=utf-8' } });
   }
-
   try {
     const res = await server.respond(new Request('http://isr-worker/__404__'), {
       getClientAddress: () => '127.0.0.1',
     });
     const html = await res.arrayBuffer();
     await Bun.write(fallback404Path, html);
-
-    return new Response(html, {
-      status: 404,
-      headers: { 'content-type': 'text/html; charset=utf-8' },
-    });
+    return new Response(html, { status: 404, headers: { 'content-type': 'text/html; charset=utf-8' } });
   } catch {
     return new Response('Not Found', { status: 404 });
   }
@@ -609,7 +564,7 @@ const bunServer = Bun.serve({
     const pathname = url.pathname;
     const acceptEncoding = request.headers.get('accept-encoding');
 
-    // 1. Static Client Assets (_app/*, static directory files)
+    /** 1. Static client assets (_app/*, static directory files). */
     if (SERVE_ASSETS) {
       const relativePath = pathname.startsWith(base) ? pathname.slice(base.length) : pathname;
       if (relativePath !== '/' && relativePath !== '') {
@@ -620,7 +575,6 @@ const bunServer = Bun.serve({
           if (relativePath.startsWith('/_app/immutable/')) {
             headers['cache-control'] = 'public,max-age=31536000,immutable';
           }
-
           const compressed = await negotiateCompressed(assetPath, acceptEncoding);
           if (compressed) {
             headers['content-encoding'] = compressed.encoding;
@@ -631,73 +585,51 @@ const bunServer = Bun.serve({
       }
     }
 
-    // 2. Prerendered ISR Pages
+    /** 2. Prerendered ISR pages — O(1) index lookup, background revalidation if stale. */
     if (SERVE_ASSETS) {
-      const filePath = await getPrerenderedFilePath(pathname);
-
-      if (filePath) {
+      const entry = prerendered.get(pathname);
+      if (entry) {
+        const { file: filePath, type } = entry;
         const route = findRouteForPath(pathname);
         const revalidateSec = route ? isrRoutes[route.id]?.revalidate : null;
 
-        if (revalidateSec !== undefined && revalidateSec !== null) {
+        if (revalidateSec != null) {
           try {
-            const fileStat = await stat(filePath);
-            const age = Date.now() - fileStat.mtimeMs;
-            if (age > revalidateSec * 1000) {
-              regenerateIsr(pathname);
-            }
+            const age = Date.now() - (await stat(filePath)).mtimeMs;
+            if (age > revalidateSec * 1000) regenerateIsr(pathname);
           } catch {
             regenerateIsr(pathname);
           }
         }
 
         const freshFile = Bun.file(filePath);
-        const headers = {
-          'content-type': freshFile.type || 'text/html; charset=utf-8',
-          vary: 'Accept-Encoding'
-        };
-
+        const headers = { 'content-type': type || 'text/html; charset=utf-8', vary: 'Accept-Encoding' };
         const compressed = await negotiateCompressed(filePath, acceptEncoding);
         if (compressed) {
           headers['content-encoding'] = compressed.encoding;
           return new Response(compressed.file, { headers });
         }
-
         return new Response(freshFile, { headers });
       }
     }
 
-    // 3. Block dynamic SSR for unknown ISR paths (Bounded Negative Caching)
+    /** 3. Unknown paths under an ISR-enabled route: trigger background generation, serve static 404 now. */
     const route = findRouteForPath(pathname);
     if (route && isrRoutes[route.id]) {
       const revalidateSec = isrRoutes[route.id]?.revalidate;
-
-      if (revalidateSec !== undefined && revalidateSec !== null) {
+      if (revalidateSec != null) {
         const now = Date.now();
         const lastCheck = missingPathsCache.get(pathname);
-
-        // If the path isn't in cache, or the revalidate time window has passed
         if (!lastCheck || now - lastCheck > revalidateSec * 1000) {
-
-          // OOM Protection: If cache gets too big during a brute-force attack, flush it
-          if (missingPathsCache.size >= MAX_MISSING_CACHE) {
-            missingPathsCache.clear();
-          }
-
+          if (missingPathsCache.size >= MAX_MISSING_CACHE) missingPathsCache.clear();
           missingPathsCache.set(pathname, now);
-
-          // Trigger SvelteKit generation in the background.
-          // If the page actually exists now, it will be written to disk for the NEXT request.
-          regenerateIsr(pathname);
+          regenerateIsr(pathname); // writes to disk for the *next* request if it now exists
         }
       }
-
-      // ALWAYS return the static 404 file immediately for this request
-      // This saves CPU and memory from rendering 404s dynamically.
       return get404Response();
     }
 
-    // 4. Everything else: normal dynamic SSR
+    /** 4. Everything else: normal dynamic SSR. */
     return server.respond(request, {
       platform: { server: bunServer, request },
       getClientAddress: () => request.headers.get('x-forwarded-for') ?? '127.0.0.1',
@@ -711,14 +643,12 @@ console.log(
     : \`\${ADAPTER_NAME} listening on http://\${HOST}:\${bunServer.port} (pid \${process.pid})\`
 );
 
-const shutdown = () => {
-  process.exit(0);
-};
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', () => process.exit(0));
 `;
 }
 
+/** Generates the cluster supervisor (`index.js` when `cluster: true`), which spawns one worker per core. */
 function generateSupervisorCode(opts: { envPrefix: string }): string {
 	const { envPrefix } = opts;
 
@@ -735,17 +665,12 @@ function env(name, fallback) {
   return value === undefined ? fallback : value;
 }
 
-const cpusRaw = env('CPUS', undefined);
-const cpusFromEnv = cpusRaw === undefined ? undefined : Number(cpusRaw);
-const CPUS =
-  cpusFromEnv && cpusFromEnv > 0
-    ? Math.floor(cpusFromEnv)
-    : (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) ||
-      osCpus().length ||
-      1;
+const cpusFromEnv = Number(env('CPUS', 0));
+const CPUS = cpusFromEnv > 0
+  ? Math.floor(cpusFromEnv)
+  : (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || osCpus().length || 1;
 
 const BUN_BINARY = env('BUN_BINARY', undefined) || process.execPath || 'bun';
-
 const APP_ENTRY = join(import.meta.dir, 'app.js');
 
 console.log(\`[\${ADAPTER_NAME}] supervisor (pid \${process.pid}) starting \${CPUS} worker(s) via \${BUN_BINARY}\`);
@@ -753,6 +678,7 @@ console.log(\`[\${ADAPTER_NAME}] supervisor (pid \${process.pid}) starting \${CP
 let shuttingDown = false;
 const workers = new Array(CPUS);
 
+/** Spawn worker i, respawning it on unexpected exit until shutdown begins. */
 function spawnWorker(i) {
   const proc = spawn({
     cmd: [BUN_BINARY, APP_ENTRY],
@@ -761,39 +687,26 @@ function spawnWorker(i) {
     stderr: 'inherit',
     stdin: 'inherit',
   });
-
   workers[i] = proc;
-
   proc.exited.then((code) => {
     if (shuttingDown) return;
-    console.warn(
-      \`[\${ADAPTER_NAME}] worker \${i} (pid \${proc.pid}) exited with code \${code}, respawning\`,
-    );
+    console.warn(\`[\${ADAPTER_NAME}] worker \${i} (pid \${proc.pid}) exited with code \${code}, respawning\`);
     spawnWorker(i);
   });
-
   return proc;
 }
 
-for (let i = 0; i < CPUS; i++) {
-  spawnWorker(i);
-}
+for (let i = 0; i < CPUS; i++) spawnWorker(i);
 
 function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(\`[\${ADAPTER_NAME}] supervisor received \${signal}, stopping \${CPUS} worker(s)\`);
-  for (const w of workers) {
-    if (w) w.kill(signal);
-  }
+  for (const w of workers) w?.kill(signal);
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('exit', () => {
-  for (const w of workers) {
-    if (w) w.kill();
-  }
-});
+process.on('exit', () => { for (const w of workers) w?.kill(); });
 `;
 }
