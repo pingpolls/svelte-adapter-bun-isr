@@ -388,7 +388,19 @@ async function indexPrerendered(dir, routeBase) {
     const route = isHtmlIndex
       ? routeBase || '/'
       : \`\${routeBase}/\${dot > 0 && entry.name.endsWith('.html') ? entry.name.slice(0, dot) : entry.name}\`;
-    prerendered.set(route, { file: abs, type: Bun.file(abs).type });
+
+    // Cache the timestamp and compression status in memory at boot
+    const stats = await stat(abs);
+    prerendered.set(route, {
+      file: abs,
+      type: Bun.file(abs).type,
+      timestamp: stats.mtimeMs,
+      compressed: {
+        br: existsSync(abs + '.br') ? Bun.file(abs + '.br') : null,
+        zstd: existsSync(abs + '.zst') ? Bun.file(abs + '.zst') : null,
+        gzip: existsSync(abs + '.gz') ? Bun.file(abs + '.gz') : null,
+      }
+    });
   }
 }
 await indexPrerendered(PRERENDERED_DIR, '');
@@ -438,7 +450,14 @@ async function regenerateIsr(path) {
     const type = response.headers.get('content-type') || Bun.file(filePath).type;
     await Bun.write(filePath, await response.arrayBuffer());
     await Promise.all(['.br', '.gz', '.zst'].map((ext) => unlink(filePath + ext).catch(() => {})));
-    prerendered.set(path, { file: filePath, type });
+
+    // Update memory map with fresh timestamp and drop compressed file references
+    prerendered.set(path, {
+      file: filePath,
+      type,
+      timestamp: Date.now(),
+      compressed: { br: null, zstd: null, gzip: null }
+    });
     return true;
   } catch (err) {
     console.error(\`[\${ADAPTER_NAME}] regenerate failed for \${path}\`, err);
@@ -588,26 +607,40 @@ const bunServer = Bun.serve({
     if (SERVE_ASSETS) {
       const entry = prerendered.get(pathname);
       if (entry) {
-        const { file: filePath, type } = entry;
-        const route = findRouteForPath(pathname);
-        const revalidateSec = route ? isrRoutes[route.id]?.revalidate : null;
+        const { file: filePath, type, timestamp, compressed } = entry;
 
-        if (revalidateSec != null) {
-          try {
-            const age = Date.now() - (await stat(filePath)).mtimeMs;
-            if (age > revalidateSec * 1000) regenerateIsr(pathname);
-          } catch {
-            regenerateIsr(pathname);
-          }
+        // Cache the route lookup on the entry so we don't regex-scan routes on every request
+        if (entry.revalidateSec === undefined) {
+          const route = findRouteForPath(pathname);
+          entry.revalidateSec = route ? isrRoutes[route.id]?.revalidate ?? null : null;
+        }
+
+        if (entry.revalidateSec != null) {
+          // Pure in-memory age check. No I/O blocking.
+          const age = Date.now() - timestamp;
+          if (age > entry.revalidateSec * 1000) regenerateIsr(pathname);
         }
 
         const freshFile = Bun.file(filePath);
         const headers = { 'content-type': type || 'text/html; charset=utf-8', vary: 'Accept-Encoding' };
-        const compressed = await negotiateCompressed(filePath, acceptEncoding);
-        if (compressed) {
-          headers['content-encoding'] = compressed.encoding;
-          return new Response(compressed.file, { headers });
+
+        // Pure memory lookup for compression, bypassing the negotiateCompressed disk checks
+        if (acceptEncoding) {
+          const accepts = acceptEncoding.toLowerCase();
+          if (accepts.includes('br') && compressed.br) {
+            headers['content-encoding'] = 'br';
+            return new Response(compressed.br, { headers });
+          }
+          if (accepts.includes('zstd') && compressed.zstd) {
+            headers['content-encoding'] = 'zstd';
+            return new Response(compressed.zstd, { headers });
+          }
+          if (accepts.includes('gzip') && compressed.gzip) {
+            headers['content-encoding'] = 'gzip';
+            return new Response(compressed.gzip, { headers });
+          }
         }
+
         return new Response(freshFile, { headers });
       }
     }
