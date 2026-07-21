@@ -485,8 +485,14 @@ async function regenerateIsr(path) {
   }
 }
 
+// Under the cluster supervisor every worker imports this same module, so
+// without a guard this log fires once per worker. WORKER_INDEX is only set
+// by the supervisor (see generateSupervisorCode) — worker 0 prints it,
+// everyone else stays quiet. Unset (cluster: false, single process) also
+// prints, since there's only one process to begin with.
+const workerIndex = env('WORKER_INDEX', undefined);
 const isrPathCount = Object.keys(isrRevalidate).length;
-if (isrPathCount > 0) {
+if (isrPathCount > 0 && (workerIndex === undefined || workerIndex === '0')) {
   console.log(\`[\${ADAPTER_NAME}] ISR (stale-while-revalidate) enabled for \${isrPathCount} route(s)\`);
 }
 
@@ -624,7 +630,7 @@ const workers = new Array(CPUS);
 function spawnWorker(i) {
   const proc = spawn({
     cmd: [BUN_BINARY, APP_ENTRY],
-    env: Bun.env,
+    env: { ...Bun.env, [ENV_PREFIX + 'WORKER_INDEX']: String(i) },
     stdout: 'inherit',
     stderr: 'inherit',
     stdin: 'inherit',
