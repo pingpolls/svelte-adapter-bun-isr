@@ -373,6 +373,7 @@ import { manifest, prerendered, base, isrRevalidate } from './server/manifest.js
 ${hasWebsocketExport ? "import { websocket } from './server/hooks.js';" : ""}
 import { Glob } from 'bun';
 import { join } from 'node:path';
+import { stat, unlink } from 'node:fs/promises';
 
 const ADAPTER_NAME = 'svelte-adapter-bun-isr';
 const ENV_PREFIX = ${JSON.stringify(envPrefix)};
@@ -424,13 +425,13 @@ if (SERVE_ASSETS) {
     for (const filePath of candidates) {
       const f = Bun.file(filePath);
       if (await f.exists()) {
-        prerenderedFiles.set(p, f);
+        // CHANGE: Store the raw string path, NOT the 'f' object
+        prerenderedFiles.set(p, filePath);
         break;
       }
     }
   }
 }
-
 // Negotiate best precompressed variant for a file path + Accept-Encoding header.
 // Returns { file, encoding } or null if nothing precompressed is available/accepted.
 async function negotiateCompressed(filePath, acceptEncoding) {
@@ -475,36 +476,8 @@ async function negotiateCompressed(filePath, acceptEncoding) {
 // different worker processes can still both regenerate the same path around
 // the same time; that's a harmless duplicate write (last one wins), not a
 // correctness problem, so it isn't worth a cross-process lock.
-const ISR_CACHE_DIR = join(import.meta.dir, '.isr-cache');
 const isrInFlight = new Set(); // paths currently being regenerated *in this process*
 const serverStartedAt = Date.now();
-
-function isrCacheFile(path) {
-  // Turn a route path into a flat, filesystem-safe file name under
-  // ISR_CACHE_DIR. Collisions are not a practical concern: SvelteKit route
-  // paths are already unique, and this only has to round-trip through
-  // itself, not be human-decodable.
-  const safe = (path === '/' ? 'index' : path.replace(/^\\//, '')).replace(/[^a-zA-Z0-9_-]/g, '_');
-  return join(ISR_CACHE_DIR, safe + '.json');
-}
-
-async function readIsrCache(path) {
-  const f = Bun.file(isrCacheFile(path));
-  if (!(await f.exists())) return null;
-  try {
-    return await f.json(); // { html, timestamp }
-  } catch {
-    // Corrupt or partially-written file (e.g. we read mid-write from another
-    // worker) — treat as a cache miss rather than crashing the request.
-    return null;
-  }
-}
-
-async function writeIsrCache(path, html) {
-  // Bun.write creates ISR_CACHE_DIR (and any nested dirs) on demand, so no
-  // separate mkdir step is needed here or at server startup.
-  await Bun.write(isrCacheFile(path), JSON.stringify({ html, timestamp: Date.now() }));
-}
 
 async function regenerateIsr(path) {
   if (isrInFlight.has(path)) return;
@@ -515,7 +488,20 @@ async function regenerateIsr(path) {
       getClientAddress: () => '127.0.0.1',
     });
     if (response.status === 200) {
-      await writeIsrCache(path, await response.text());
+      const filePath = prerenderedFiles.get(path);
+
+      if (filePath) {
+        // Write directly to the string path
+        await Bun.write(filePath, await response.arrayBuffer());
+
+        const exts = ['.br', '.gz', '.zst'];
+        for (const ext of exts) {
+          const compFile = Bun.file(filePath + ext);
+          if (await compFile.exists()) {
+            await unlink(filePath + ext).catch(() => {});
+          }
+        }
+      }
     } else {
       console.warn(\`[\${ADAPTER_NAME}] ISR regenerate \${path} -> \${response.status}, keeping stale content\`);
     }
@@ -534,7 +520,7 @@ async function regenerateIsr(path) {
 const workerIndex = env('WORKER_INDEX', undefined);
 const isrPathCount = Object.keys(isrRevalidate).length;
 if (isrPathCount > 0 && (workerIndex === undefined || workerIndex === '0')) {
-  console.log(\`[\${ADAPTER_NAME}] ISR (stale-while-revalidate) enabled for \${isrPathCount} route(s), cache at \${ISR_CACHE_DIR}\`);
+  console.log(\`[\${ADAPTER_NAME}] ISR enabled for \${isrPathCount} route(s), writing directly to \${PRERENDERED_DIR}\`);
 }
 
 const bunServer = Bun.serve({
@@ -568,37 +554,41 @@ const bunServer = Bun.serve({
 
     // 2. Prerendered pages, with stale-while-revalidate for ISR-configured routes
     if (SERVE_ASSETS) {
-      const revalidateSec = isrRevalidate[pathname];
+      // This is now a string path!
+      const filePath = prerenderedFiles.get(pathname);
 
-      if (revalidateSec !== undefined) {
-        const cached = await readIsrCache(pathname);
-        const age = Date.now() - (cached ? cached.timestamp : serverStartedAt);
-        const isStale = age > revalidateSec * 1000;
+      if (filePath) {
+        const revalidateSec = isrRevalidate[pathname];
 
-        if (isStale) {
-          // Fire-and-forget: don't block this response on regeneration.
-          // Next request(s) after this one will pick up the fresh HTML,
-          // whichever worker process serves them.
-          regenerateIsr(pathname);
+        if (revalidateSec !== undefined) {
+          try {
+            const fileStat = await stat(filePath);
+            const age = Date.now() - fileStat.mtimeMs;
+            const isStale = age > revalidateSec * 1000;
+
+            if (isStale) {
+              regenerateIsr(pathname);
+            }
+          } catch (e) {
+            regenerateIsr(pathname);
+          }
         }
 
-        if (cached) {
-          return new Response(cached.html, { headers: { 'Content-Type': 'text/html' } });
-        }
-        // No regenerated version on disk yet — fall through and serve the
-        // build-time prerendered file below (still correct HTML, just
-        // possibly stale).
-      }
+        // Dynamically create a new BunFile instance so the file size is always 100% accurate!
+        const freshFile = Bun.file(filePath);
 
-      const prerenderedFile = prerenderedFiles.get(pathname);
-      if (prerenderedFile) {
-        const headers = { 'Content-Type': 'text/html', vary: 'Accept-Encoding' };
-        const compressed = await negotiateCompressed(prerenderedFile.name, acceptEncoding);
+        const headers = {
+          'Content-Type': freshFile.type || 'text/html',
+          vary: 'Accept-Encoding'
+        };
+
+        const compressed = await negotiateCompressed(filePath, acceptEncoding);
         if (compressed) {
           headers['content-encoding'] = compressed.encoding;
           return new Response(compressed.file, { headers });
         }
-        return new Response(prerenderedFile, { headers });
+
+        return new Response(freshFile, { headers });
       }
     }
 
