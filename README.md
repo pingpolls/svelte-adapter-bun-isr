@@ -1,14 +1,38 @@
-# SvelteKit Bun Adapter ISR 
+# SvelteKit Bun Adapter ISR
 
-A SvelteKit adapter for Bun that supports:
+**The fastest way to deploy SvelteKit on Bun.** A production-ready [SvelteKit](https://kit.svelte.dev) adapter for the [Bun](https://bun.sh) runtime with built-in Incremental Static Regeneration (ISR), native clustering, and precompression — no reverse proxy or edge platform required.
 
-- Bun server output
-- Static client asset serving
-- Prerendered page serving
-- Optional precompression at build time
-- Incremental Static Regeneration style revalidation for prerendered routes
-- Optional `hooks.server` websocket export bundling
-- Optional multi-core process clustering via bun's native `reusePort`
+In head-to-head benchmarks against the standard `svelte-adapter-bun`, this adapter delivers **up to 4.7x more throughput** and **up to 4x lower latency**, with ISR-cached routes matching static prerender speed at roughly **300,000 requests/sec**.
+
+[![npm version](https://img.shields.io/npm/v/@pingpolls/svelte-adapter-bun-isr)](https://www.npmjs.com/package/@pingpolls/svelte-adapter-bun-isr)
+[![license](https://img.shields.io/npm/l/@pingpolls/svelte-adapter-bun-isr)](https://github.com/pingpolls/svelte-adapter-bun-isr/blob/main/LICENSE)
+
+## Why this adapter
+
+- **Bun-native server output** — no Node.js required at runtime
+- **Incremental Static Regeneration (ISR)** for prerendered routes — get static-file speed with background revalidation, no rebuild needed
+- **Multi-core clustering** via Bun's native `reusePort` — scales across every CPU core out of the box
+- **Static asset and prerendered page serving** straight from Bun
+- **Optional precompression** at build time (`.gz`, `.br`, `.zst`)
+- **WebSocket support** via `hooks.server` export bundling
+
+## Benchmarked performance
+
+Load-tested with `wrk` (15s duration, 12 threads, 512 concurrent connections) against `svelte-adapter-bun` on identical hardware.
+
+![Throughput comparison: svelte-adapter-bun vs @pingpolls/svelte-adapter-bun-isr](https://raw.githubusercontent.com/pingpolls/svelte-adapter-bun-isr/refs/heads/main/benchmark/throughput.webp)
+
+![Latency comparison: svelte-adapter-bun vs @pingpolls/svelte-adapter-bun-isr](https://raw.githubusercontent.com/pingpolls/svelte-adapter-bun-isr/refs/heads/main/benchmark/latency.webp)
+
+| Mode | svelte-adapter-bun | @pingpolls/svelte-adapter-bun-isr | Improvement |
+|---|---|---|---|
+| SSR, no caching | 7,516 req/s · 67.08ms avg | 32,451 req/s · 15.72ms avg | **4.3x throughput, 4.3x lower latency** |
+| SSG, prerendered | 64,208 req/s · 7.84ms avg | 300,057 req/s · 1.69ms avg | **4.7x throughput, 4.6x lower latency** |
+| ISR, prerendered + revalidation | — | 299,767 req/s · 1.69ms avg | **matches static prerender speed** |
+
+The headline result: ISR-cached responses perform essentially identically to plain static prerendering, meaning you get on-demand content freshness without paying a caching-layer tax.
+
+> **Disclaimer on SSR numbers.** On a single core, raw SSR throughput between this adapter and `svelte-adapter-bun` is not far apart — our adapter alone gets roughly 7,500 req/s single-core, in the same ballpark as the baseline. The SSR gap shown above comes from built-in multi-core clustering (`cluster: true`, on by default): this adapter automatically spawns a worker per available CPU via `reusePort`, so it scales with whatever hardware it's running on without extra process-manager setup. Worker count can also be pinned manually with the `CPUS` runtime env var (or `${envPrefix}CPUS` if you set a prefix) instead of relying on auto-detection. That clustering behavior, not raw per-core SSR speed, is where the real advantage comes from.
 
 ## What this adapter does
 
