@@ -75,8 +75,8 @@ export default defineConfig({
         idleTimeout: 10,
         websockets: true,
         cluster: true
+        }),
       }),
-		}),
 	],
 });
 ```
