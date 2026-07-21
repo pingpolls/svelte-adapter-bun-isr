@@ -101,6 +101,17 @@ export default {
 };
 ```
 
+Then in the `+server.ts` or `+layout.server.ts` or `+page.server.ts` we can use:
+
+```typescript
+import type { Config } from "@pingpolls/svelte-adapter-bun-isr";
+
+export const prerender = "auto";
+export const config: Config = {
+	revalidate: 15, // In seconds, stale-while-revalidate concept
+};
+```
+
 Then build and run:
 
 ```bash
