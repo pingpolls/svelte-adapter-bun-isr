@@ -36,9 +36,9 @@
  *   - The initial DB migration is performed by running
  *     `src/scripts/prep.ts` directly with bun (creates the sqlite schema,
  *     no seed rows).
- *   - `/no-isr/server` exists as the no-isr counterpart of `/isr/server`
- *     (the dir listing only showed `/isr/server/+server.ts`, but the test
- *     spec explicitly checks `/no-isr/server`, so it's assumed to exist
+ *   - `/no-isr/server.json` exists as the no-isr counterpart of `/isr/server.json`
+ *     (the dir listing only showed `/isr/server.json/+server.ts`, but the test
+ *     spec explicitly checks `/no-isr/server.json`, so it's assumed to exist
  *     with the same JSON contract).
  *   - The todos table backing every route is shared/global (not scoped
  *     per-route) — a single POST to /api/todos is expected to eventually
@@ -303,7 +303,7 @@ describe("ISR System", () => {
 				const list = await fetchPageSections(p);
 				expect(list.length).toBe(0);
 			}
-			for (const p of ["/no-isr/server", "/isr/server"]) {
+			for (const p of ["/no-isr/server.json", "/isr/server.json"]) {
 				expect((await fetchJsonTodos(p)).length).toBe(0);
 			}
 		},
@@ -321,7 +321,7 @@ describe("ISR System", () => {
 				const list = await fetchPageSections(p);
 				expect(list.length).toBe(0);
 			}
-			for (const p of ["/no-isr/server", "/isr/server"]) {
+			for (const p of ["/no-isr/server.json", "/isr/server.json"]) {
 				expect((await fetchJsonTodos(p)).length).toBe(0);
 			}
 		},
@@ -337,8 +337,8 @@ describe("ISR System", () => {
 			// gets triggered by these fetches, so a single check is enough.
 			for (const p of [
 				"/no-isr/page",
-				"/no-isr/server",
-				"/isr/server",
+				"/no-isr/server.json",
+				"/isr/server.json",
 				"/isr/layout",
 			]) {
 				const count = p.includes("server")
@@ -360,11 +360,11 @@ describe("ISR System", () => {
 	);
 
 	test(
-		"Wait 2 more seconds (t=4s: isr/server's 4s window elapses).",
+		"Wait 2 more seconds (t=4s: isr/server.json's 4s window elapses).",
 		async () => {
 			await Bun.sleep(2 * 1000);
 
-			for (const p of ["/no-isr/page", "/no-isr/server", "/isr/layout"]) {
+			for (const p of ["/no-isr/page", "/no-isr/server.json", "/isr/layout"]) {
 				const count = p.includes("server")
 					? (await fetchJsonTodos(p)).length
 					: (await fetchPageSections(p)).length;
@@ -379,9 +379,9 @@ describe("ISR System", () => {
 				expect(list.length).toBe(1);
 			}
 
-			// isr/server's 4s window HAS elapsed: same stale-then-fresh dance.
+			// isr/server.json's 4s window HAS elapsed: same stale-then-fresh dance.
 			await assertSwrTransition(
-				async () => (await fetchJsonTodos("/isr/server")).length,
+				async () => (await fetchJsonTodos("/isr/server.json")).length,
 				0,
 				1,
 			);
@@ -394,7 +394,7 @@ describe("ISR System", () => {
 		async () => {
 			await Bun.sleep(2 * 1000);
 
-			for (const p of ["/no-isr/page", "/no-isr/server"]) {
+			for (const p of ["/no-isr/page", "/no-isr/server.json"]) {
 				const count =
 					p === "/no-isr/page"
 						? (await fetchPageSections(p)).length
@@ -408,7 +408,7 @@ describe("ISR System", () => {
 				const list = await fetchPageSections("/isr/page");
 				expect(list.length).toBe(1);
 			}
-			expect((await fetchJsonTodos("/isr/server")).length).toBe(1);
+			expect((await fetchJsonTodos("/isr/server.json")).length).toBe(1);
 
 			// isr/layout's 6s window HAS elapsed.
 			await assertSwrTransition(
@@ -450,7 +450,7 @@ describe("ISR System", () => {
 				const list = await fetchPageSections(p);
 				expect(list.length).toBe(1);
 			}
-			for (const p of ["/no-isr/server", "/isr/server"]) {
+			for (const p of ["/no-isr/server.json", "/isr/server.json"]) {
 				expect((await fetchJsonTodos(p)).length).toBe(1);
 			}
 		},
