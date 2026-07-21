@@ -206,7 +206,14 @@ export default function (options: AdapterOptions = {}): Adapter {
 							naming: "hooks.js",
 							target: "bun",
 							format: "esm",
-							external: ["$env/*", "$app/*", "$lib/*"],
+							// $env/* and $app/* are Vite-only virtual modules — no physical
+							// file exists for Bun to resolve, so they stay external.
+							// $lib/* is real project code (src/lib) resolved via
+							// tsconfig.json "paths" — do NOT externalize it, or any
+							// hooks.server.ts that imports from $lib (db clients,
+							// session stores, etc.) will emit an unresolved import
+							// and crash at runtime instead of build time.
+							external: ["$env/*", "$app/*"],
 						});
 						if (result.success) {
 							hasWebsocketExport = true;

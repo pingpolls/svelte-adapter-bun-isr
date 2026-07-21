@@ -7,7 +7,7 @@ export default defineConfig({
 	plugins: [
 		tailwindcss(),
 		sveltekit({
-			adapter: BunISRAdapter({ port: 3000 }),
+			adapter: BunISRAdapter({ websockets: true }),
 			alias: {
 				$src: "./src",
 			},

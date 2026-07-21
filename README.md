@@ -139,25 +139,79 @@ Runtime env still wins if the prefixed `IDLE_TIMEOUT` is set.
 
 Default: `10`
 
-### `websockets`
-Bundle `src/hooks.server.ts` or `src/hooks.server.js` when it exports `websocket`, then wire it into `Bun.serve`.
+### WebSockets
 
-Default: `true`
+Bun WebSockets are wired up through two pieces:
 
-## ISR route config
+1. an `export const websocket` in `src/hooks.server.ts` — this is the
+   `Bun.WebSocketHandler` (`open`/`message`/`close`/`drain`) passed straight
+   into `Bun.serve`. The adapter detects and bundles this export at build
+   time (set `websockets: false` to skip it for plain HTTP apps).
+2. a call to `event.platform.server.upgrade(event.platform.request)` at the
+   point you want to upgrade the connection — either globally in `handle`,
+   or per-route in a `+server.ts`. This is the actual trigger; without it
+   the request just resolves as a normal HTTP response.
 
-Use SvelteKit's route config in `+page.server.ts`, `+page.ts`, or layout equivalents.
-
-Example:
+#### Global upgrade via `hooks.server.ts`
 
 ```ts
-import type { Config } from '@pingpolls/svelte-adapter-bun-isr';
+// src/hooks.server.ts
+import type { Handle } from '@sveltejs/kit';
 
-export const prerender = 'auto';
-export const config: Config = {
-  revalidate: 5
+export const handle: Handle = async ({ event, resolve }) => {
+  const { request } = event;
+  const isUpgrade =
+    request.headers.get('connection')?.toLowerCase().includes('upgrade') &&
+    request.headers.get('upgrade')?.toLowerCase() === 'websocket';
+
+  if (isUpgrade && new URL(request.url).pathname === '/ws') {
+    const upgraded = event.platform!.server.upgrade(event.platform!.request);
+    if (upgraded) return new Response(null, { status: 101 });
+  }
+
+  return resolve(event);
+};
+
+export const websocket: Bun.WebSocketHandler<undefined> = {
+  open(ws) {
+    ws.send('connected');
+  },
+  message(ws, message) {
+    ws.send(message); // echo
+  },
 };
 ```
+
+#### Per-route upgrade via `+server.ts`
+
+```ts
+// src/routes/ws/+server.ts
+import type { RequestHandler } from './$types';
+
+export const GET: RequestHandler = ({ platform }) => {
+  const upgraded = platform!.server.upgrade(platform!.request);
+  return upgraded ? new Response(null, { status: 101 }) : new Response('Upgrade failed', { status: 500 });
+};
+```
+
+Either pattern works because ISR/static-asset requests never reach `server.respond()` — only the dynamic-SSR fallback (step 4 in "Runtime serving order") does, and that's exactly where `platform.server`/`platform.request` are injected.
+
+#### Types
+
+```ts
+// src/app.d.ts
+declare global {
+  namespace App {
+    interface Platform {
+      server: Bun.Server;
+      request: Request;
+    }
+  }
+}
+export {};
+```
+
+Bun's pub/sub API works the same way as everywhere else — `ws.subscribe('room')` / `ws.publish(...)` inside the `websocket` handlers, or `event.platform.server.publish('room', data)` from any hook or `+server.ts`.
 
 ### Important
 
