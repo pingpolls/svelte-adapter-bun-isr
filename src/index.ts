@@ -22,7 +22,7 @@ interface AdapterOptions {
 	idleTimeout?: number;
 	/** Bundle hooks.server's `websocket` export into Bun.serve. Default: true */
 	websockets?: boolean;
-	/** Spawn one worker per core behind SO_REUSEPORT via a supervisor. Default: true */
+	/** Spawn one worker per core behind SO_REUSEPORT via a supervisor. If this enabled, adapter will generate two file, `app.js` and `index.js` while the `index.js` file will consist of Bun spawn commands running `app.js` file. Default: true */
 	cluster?: boolean;
 }
 
@@ -66,8 +66,7 @@ const SKIP_COMPRESS_EXT = new Set([
 
 /**
  * Trigger an ISR regeneration from inside a running server, e.g. a
- * `+server.ts` endpoint. Only works while `build/app.js` (or
- * `build/index.js` with `cluster: false`) is actually running.
+ * `+server.ts`, `+page.server.ts` or `+layout.server.ts` endpoint.
  */
 export function regenerate(
 	paths: string[],
