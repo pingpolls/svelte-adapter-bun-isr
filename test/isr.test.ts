@@ -62,7 +62,7 @@ const PORT = Number(process.env.TEST_PORT ?? 3000);
 const BASE_URL = `http://localhost:${PORT}`;
 
 const PREP_CMD = ["bun", "run", "prepare"];
-const MIGRATE_CMD = ["bun", "run", "src/scripts/prep.ts"];
+const MIGRATE_CMD = ["bun", "src/scripts/prep.ts"];
 const BUILD_CMD = ["bun", "run", "build"];
 const START_CMD = ["bun", "run", "start"];
 

@@ -23,7 +23,7 @@ interface AdapterOptions {
 	precompress?: boolean;
 	/**
 	 * Prefix applied to runtime env vars read by the generated server
-	 * (HOST, PORT, SOCKET_PATH, IDLE_TIMEOUT). Default: ''
+	 * (HOST, PORT, SOCKET_PATH, IDLE_TIMEOUT, CPUS, BUN_BINARY). Default: ''
 	 */
 	envPrefix?: string;
 	/**
@@ -36,6 +36,21 @@ interface AdapterOptions {
 	 * Bun.serve. Set false for plain HTTP apps. Default: true
 	 */
 	websockets?: boolean;
+	/**
+	 * Emit a `build/index.js` supervisor that spawns `build/app.js` across
+	 * multiple worker processes (bound with SO_REUSEPORT) for multi-core
+	 * throughput. Worker count and binary are resolved entirely at
+	 * runtime — see the `${envPrefix}CPUS` / `${envPrefix}BUN_BINARY` env
+	 * vars documented on the generated supervisor.
+	 *
+	 * Set false if something else already manages process count (PM2
+	 * `-i max`, k8s replicas/HPA, fly.io machines-per-core, etc.) — in
+	 * that case `build/index.js` IS the server directly, same as before
+	 * this option existed. Running the supervisor *and* an external
+	 * process manager at once will multiply your worker count by both,
+	 * so pick one. Default: true
+	 */
+	cluster?: boolean;
 }
 
 /**
@@ -70,6 +85,7 @@ export default function (options: AdapterOptions = {}): Adapter {
 		envPrefix = "",
 		idleTimeout = 10,
 		websockets = true,
+		cluster = true,
 	} = options;
 
 	return {
@@ -228,9 +244,14 @@ export default function (options: AdapterOptions = {}): Adapter {
 				}
 			}
 
-			// 6. Write the Bun server entry point with ISR caching
+			// 6. Write the Bun server entry point with ISR caching.
+			// When clustering is on, the real server lands at `app.js` and
+			// `index.js` becomes the supervisor that spawns N copies of it.
+			// When clustering is off, the server itself is `index.js`, same
+			// as before this option existed.
+			const serverFileName = cluster ? "app.js" : "index.js";
 			writeFileSync(
-				join(dest, "index.js"),
+				join(dest, serverFileName),
 				generateServerCode({
 					serveAssets,
 					envPrefix,
@@ -238,6 +259,13 @@ export default function (options: AdapterOptions = {}): Adapter {
 					hasWebsocketExport,
 				}),
 			);
+
+			if (cluster) {
+				writeFileSync(
+					join(dest, "index.js"),
+					generateSupervisorCode({ envPrefix }),
+				);
+			}
 
 			builder.log.minor(`Adapter output written to ${dest}`);
 		},
@@ -429,6 +457,10 @@ async function negotiateCompressed(filePath, acceptEncoding) {
 // regeneration. Before that, the build-time prerendered file is served as
 // the initial "stale" baseline. Resets on process restart (falls back to
 // the build-time file again, which is still valid, just possibly stale).
+//
+// NOTE: this cache is per-process. Under the clustering supervisor each
+// worker regenerates/staleness-checks independently — see the note in
+// generateSupervisorCode for why that's left as-is rather than shared.
 const isrCache = new Map();
 const isrInFlight = new Set(); // paths currently being regenerated, dedupes concurrent triggers
 const serverStartedAt = Date.now();
@@ -531,8 +563,8 @@ const bunServer = Bun.serve({
 
 console.log(
   SOCKET_PATH
-    ? \`\${ADAPTER_NAME} listening on unix socket \${SOCKET_PATH}\`
-    : \`\${ADAPTER_NAME} listening on http://\${HOST}:\${bunServer.port}\`
+    ? \`\${ADAPTER_NAME} listening on unix socket \${SOCKET_PATH} (pid \${process.pid})\`
+    : \`\${ADAPTER_NAME} listening on http://\${HOST}:\${bunServer.port} (pid \${process.pid})\`
 );
 
 const shutdown = () => {
@@ -540,5 +572,99 @@ const shutdown = () => {
 };
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+`;
+}
+
+function generateSupervisorCode(opts: { envPrefix: string }): string {
+	const { envPrefix } = opts;
+
+	return `
+// Cluster supervisor: spawns N copies of ./app.js, each binding the same
+// PORT/SOCKET_PATH with reusePort (SO_REUSEPORT), so the kernel load-balances
+// connections across processes/cores. app.js has no idea it's being clustered —
+// it just binds like normal.
+import { spawn } from 'bun';
+import { cpus as osCpus } from 'node:os';
+import { join } from 'node:path';
+
+const ADAPTER_NAME = 'svelte-adapter-bun-isr';
+const ENV_PREFIX = ${JSON.stringify(envPrefix)};
+
+function env(name, fallback) {
+  const value = Bun.env[ENV_PREFIX + name];
+  return value === undefined ? fallback : value;
+}
+
+// Worker count: \${envPrefix}CPUS env wins if set (0 or negative is invalid
+// and falls back). Otherwise navigator.hardwareConcurrency, then node:os as
+// a second fallback, then 1 — resolved at runtime so a build done on a
+// 4-core CI box still scales correctly on an 8-core prod host.
+const cpusRaw = env('CPUS', undefined);
+const cpusFromEnv = cpusRaw === undefined ? undefined : Number(cpusRaw);
+const CPUS =
+  cpusFromEnv && cpusFromEnv > 0
+    ? Math.floor(cpusFromEnv)
+    : (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) ||
+      osCpus().length ||
+      1;
+
+// Bun binary: \${envPrefix}BUN_BINARY env wins if set (absolute path or a
+// name resolved via PATH). Otherwise process.execPath — the exact binary
+// this supervisor is currently running under, which is the most reliable
+// "auto discovery" available (no guessing at PATH resolution order).
+const BUN_BINARY = env('BUN_BINARY', undefined) || process.execPath || 'bun';
+
+const APP_ENTRY = join(import.meta.dir, 'app.js');
+
+console.log(\`[\${ADAPTER_NAME}] supervisor (pid \${process.pid}) starting \${CPUS} worker(s) via \${BUN_BINARY}\`);
+
+let shuttingDown = false;
+const workers = new Array(CPUS);
+
+function spawnWorker(i) {
+  const proc = spawn({
+    cmd: [BUN_BINARY, APP_ENTRY],
+    env: Bun.env,
+    stdout: 'inherit',
+    stderr: 'inherit',
+    stdin: 'inherit',
+  });
+
+  workers[i] = proc;
+
+  // Bun.Subprocess has no 'exit' event — .exited is a Promise. Respawn on
+  // unexpected death so one crashed worker doesn't quietly shrink your
+  // effective concurrency; skipped entirely once shutdown() has fired.
+  proc.exited.then((code) => {
+    if (shuttingDown) return;
+    console.warn(
+      \`[\${ADAPTER_NAME}] worker \${i} (pid \${proc.pid}) exited with code \${code}, respawning\`,
+    );
+    spawnWorker(i);
+  });
+
+  return proc;
+}
+
+for (let i = 0; i < CPUS; i++) {
+  spawnWorker(i);
+}
+
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(\`[\${ADAPTER_NAME}] supervisor received \${signal}, stopping \${CPUS} worker(s)\`);
+  for (const w of workers) {
+    if (w) w.kill(signal);
+  }
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('exit', () => {
+  for (const w of workers) {
+    if (w) w.kill();
+  }
+});
 `;
 }
