@@ -66,8 +66,8 @@ import adapter from '@pingpolls/svelte-adapter-bun-isr';
 
 export default defineConfig({
 	plugins: [
-		sveltekit({
-			adapter: adapter({
+	  sveltekit({
+     	adapter: adapter({
         out: 'build',
         serveAssets: true,
         precompress: true,
