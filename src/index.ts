@@ -95,6 +95,9 @@ export default function (options: AdapterOptions = {}): Adapter {
 			const dest = join(process.cwd(), out);
 			const tmp = builder.getBuildDirectory("adapter-bun");
 
+			// Wipes the whole output dir, including any leftover .isr-cache/
+			// from a previous build — so every deploy starts with a clean ISR
+			// cache instead of possibly serving stale HTML from the last build.
 			builder.rimraf(dest);
 			builder.rimraf(tmp);
 			mkdirSync(tmp, { recursive: true });
@@ -453,17 +456,55 @@ async function negotiateCompressed(filePath, acceptEncoding) {
 //   - stale  (age >  revalidate) -> serve cached/build-time HTML immediately,
 //                                    fire a background regeneration (unawaited)
 //                                    so the NEXT request gets fresh content
-// isrCache: pathname -> { html, timestamp } — populated lazily on first
-// regeneration. Before that, the build-time prerendered file is served as
-// the initial "stale" baseline. Resets on process restart (falls back to
-// the build-time file again, which is still valid, just possibly stale).
 //
-// NOTE: this cache is per-process. Under the clustering supervisor each
-// worker regenerates/staleness-checks independently — see the note in
-// generateSupervisorCode for why that's left as-is rather than shared.
-const isrCache = new Map();
-const isrInFlight = new Set(); // paths currently being regenerated, dedupes concurrent triggers
+// The regenerated cache is persisted to disk under ISR_CACHE_DIR (inside the
+// build output, alongside client/ and prerendered/), NOT held in an in-memory
+// Map. That matters because with \`cluster: true\` there isn't one server
+// process, there are N — each is a separate OS process with its own memory,
+// so an in-memory cache is invisible to every worker except the one that
+// happened to regenerate it. Every other worker (and the kernel round-robins
+// requests across all of them via SO_REUSEPORT) would see a permanent cache
+// miss and hammer server.respond() on every single request instead of only
+// once per revalidate window. Writing to disk means whichever worker
+// regenerates first, every worker (this one on restart, and every sibling
+// worker on its next request) reads the same fresh file.
+//
+// isrInFlight below is still an in-memory Set, and that's fine — it's only a
+// per-process de-dupe so one worker doesn't fire five concurrent
+// regenerations for five concurrent requests to the same stale path. Two
+// different worker processes can still both regenerate the same path around
+// the same time; that's a harmless duplicate write (last one wins), not a
+// correctness problem, so it isn't worth a cross-process lock.
+const ISR_CACHE_DIR = join(import.meta.dir, '.isr-cache');
+const isrInFlight = new Set(); // paths currently being regenerated *in this process*
 const serverStartedAt = Date.now();
+
+function isrCacheFile(path) {
+  // Turn a route path into a flat, filesystem-safe file name under
+  // ISR_CACHE_DIR. Collisions are not a practical concern: SvelteKit route
+  // paths are already unique, and this only has to round-trip through
+  // itself, not be human-decodable.
+  const safe = (path === '/' ? 'index' : path.replace(/^\\//, '')).replace(/[^a-zA-Z0-9_-]/g, '_');
+  return join(ISR_CACHE_DIR, safe + '.json');
+}
+
+async function readIsrCache(path) {
+  const f = Bun.file(isrCacheFile(path));
+  if (!(await f.exists())) return null;
+  try {
+    return await f.json(); // { html, timestamp }
+  } catch {
+    // Corrupt or partially-written file (e.g. we read mid-write from another
+    // worker) — treat as a cache miss rather than crashing the request.
+    return null;
+  }
+}
+
+async function writeIsrCache(path, html) {
+  // Bun.write creates ISR_CACHE_DIR (and any nested dirs) on demand, so no
+  // separate mkdir step is needed here or at server startup.
+  await Bun.write(isrCacheFile(path), JSON.stringify({ html, timestamp: Date.now() }));
+}
 
 async function regenerateIsr(path) {
   if (isrInFlight.has(path)) return;
@@ -474,7 +515,7 @@ async function regenerateIsr(path) {
       getClientAddress: () => '127.0.0.1',
     });
     if (response.status === 200) {
-      isrCache.set(path, { html: await response.text(), timestamp: Date.now() });
+      await writeIsrCache(path, await response.text());
     } else {
       console.warn(\`[\${ADAPTER_NAME}] ISR regenerate \${path} -> \${response.status}, keeping stale content\`);
     }
@@ -493,7 +534,7 @@ async function regenerateIsr(path) {
 const workerIndex = env('WORKER_INDEX', undefined);
 const isrPathCount = Object.keys(isrRevalidate).length;
 if (isrPathCount > 0 && (workerIndex === undefined || workerIndex === '0')) {
-  console.log(\`[\${ADAPTER_NAME}] ISR (stale-while-revalidate) enabled for \${isrPathCount} route(s)\`);
+  console.log(\`[\${ADAPTER_NAME}] ISR (stale-while-revalidate) enabled for \${isrPathCount} route(s), cache at \${ISR_CACHE_DIR}\`);
 }
 
 const bunServer = Bun.serve({
@@ -530,21 +571,23 @@ const bunServer = Bun.serve({
       const revalidateSec = isrRevalidate[pathname];
 
       if (revalidateSec !== undefined) {
-        const cached = isrCache.get(pathname);
+        const cached = await readIsrCache(pathname);
         const age = Date.now() - (cached ? cached.timestamp : serverStartedAt);
         const isStale = age > revalidateSec * 1000;
 
         if (isStale) {
           // Fire-and-forget: don't block this response on regeneration.
-          // Next request(s) after this one will pick up the fresh HTML.
+          // Next request(s) after this one will pick up the fresh HTML,
+          // whichever worker process serves them.
           regenerateIsr(pathname);
         }
 
         if (cached) {
           return new Response(cached.html, { headers: { 'Content-Type': 'text/html' } });
         }
-        // No regenerated version yet — fall through and serve the build-time
-        // prerendered file below (still correct HTML, just possibly stale).
+        // No regenerated version on disk yet — fall through and serve the
+        // build-time prerendered file below (still correct HTML, just
+        // possibly stale).
       }
 
       const prerenderedFile = prerenderedFiles.get(pathname);
