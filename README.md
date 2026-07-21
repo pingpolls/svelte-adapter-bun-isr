@@ -1,222 +1,133 @@
 # SvelteKit Bun Adapter ISR
 
-**The fastest way to deploy SvelteKit on Bun.** A production-ready [SvelteKit](https://kit.svelte.dev) adapter for the [Bun](https://bun.sh) runtime with built-in Incremental Static Regeneration (ISR), native clustering, and precompression — no reverse proxy or edge platform required.
-
-In head-to-head benchmarks against the standard `svelte-adapter-bun`, this adapter delivers **up to 4.7x more throughput** and **up to 4x lower latency**, with ISR-cached routes matching static prerender speed at roughly **300,000 requests/sec**.
+A production-ready [SvelteKit](https://kit.svelte.dev) adapter for [Bun](https://bun.sh) with built-in Incremental Static Regeneration (ISR), native multi-core clustering, and precompression — no reverse proxy or edge platform required.
 
 [![npm version](https://img.shields.io/npm/v/@pingpolls/svelte-adapter-bun-isr)](https://www.npmjs.com/package/@pingpolls/svelte-adapter-bun-isr)
 [![license](https://img.shields.io/npm/l/@pingpolls/svelte-adapter-bun-isr)](https://github.com/pingpolls/svelte-adapter-bun-isr/blob/main/LICENSE)
 
-## Why this adapter
-
 - **Bun-native server output** — no Node.js required at runtime
-- **Incremental Static Regeneration (ISR)** for prerendered routes — get static-file speed with background revalidation, no rebuild needed
+- **ISR** for any prerendered route, page or endpoint (`.html`, `.json`, `.csv`, whatever it renders) — static-file speed with background revalidation, no rebuild needed
 - **Multi-core clustering** via Bun's native `reusePort` — scales across every CPU core out of the box
-- **Static asset and prerendered page serving** straight from Bun
-- **Optional precompression** at build time (`.gz`, `.br`, `.zst`)
+- **Static asset + prerendered page serving** straight from Bun, with optional `.gz`/`.br`/`.zst` precompression
 - **WebSocket support** via `hooks.server` export bundling
 
-## Benchmarked performance
-
-Load-tested with `wrk` (15s duration, 12 threads, 512 concurrent connections) against `svelte-adapter-bun` on identical hardware.
-
-![Throughput comparison: svelte-adapter-bun vs @pingpolls/svelte-adapter-bun-isr](https://raw.githubusercontent.com/pingpolls/svelte-adapter-bun-isr/refs/heads/main/benchmark/throughput.webp)
-
-![Latency comparison: svelte-adapter-bun vs @pingpolls/svelte-adapter-bun-isr](https://raw.githubusercontent.com/pingpolls/svelte-adapter-bun-isr/refs/heads/main/benchmark/latency.webp)
-
-| Mode | svelte-adapter-bun | @pingpolls/svelte-adapter-bun-isr | Improvement |
-|---|---|---|---|
-| SSR, no caching | 7,516 req/s · 67.08ms avg | 32,451 req/s · 15.72ms avg | **4.3x throughput, 4.3x lower latency** |
-| SSG, prerendered | 64,208 req/s · 7.84ms avg | 300,057 req/s · 1.69ms avg | **4.7x throughput, 4.6x lower latency** |
-| ISR, prerendered + revalidation | — | 299,767 req/s · 1.69ms avg | **matches static prerender speed** |
-
-The headline result: ISR-cached responses perform essentially identically to plain static prerendering, meaning you get on-demand content freshness without paying a caching-layer tax.
-
-> **Disclaimer on SSR numbers.** On a single core, raw SSR throughput between this adapter and `svelte-adapter-bun` is not far apart — our adapter alone gets roughly 7,500 req/s single-core, in the same ballpark as the baseline. The SSR gap shown above comes from built-in multi-core clustering (`cluster: true`, on by default): this adapter automatically spawns a worker per available CPU via `reusePort`, so it scales with whatever hardware it's running on without extra process-manager setup. Worker count can also be pinned manually with the `CPUS` runtime env var (or `${envPrefix}CPUS` if you set a prefix) instead of relying on auto-detection. That clustering behavior, not raw per-core SSR speed, is where the real advantage comes from.
-
-## What this adapter does
-
-This adapter builds a Bun-hosted SvelteKit app with a generated `build/` output that contains:
-
-- `client/` for client assets
-- `prerendered/` for prerendered pages
-- `server/` for the SvelteKit server bundle and manifest
-- `app.js` as the actual Bun server (present when `cluster` is enabled)
-- `index.js` as the Bun entry point — either the server directly (`cluster: false`), or a supervisor that spawns `app.js` across worker processes (`cluster: true`, the default)
-
-At runtime, the generated server:
-
-1. Serves client assets directly from Bun when enabled
-2. Serves prerendered pages directly from Bun when enabled
-3. Falls back to dynamic SSR for everything else
-4. Keeps a small in-memory ISR cache for routes configured with `revalidate`
-
-## Installation
+## Install
 
 ```bash
 bun add @pingpolls/svelte-adapter-bun-isr
 ```
 
-## Usage
+## Quick start
 
-In `vite.config.ts`
-
-```ts
-import adapter from '@pingpolls/svelte-adapter-bun-isr';
-
-export default defineConfig({
-	plugins: [
-	  sveltekit({
-     	adapter: adapter({
-        out: 'build',
-        serveAssets: true,
-        precompress: true,
-        envPrefix: '',
-        idleTimeout: 10,
-        websockets: true,
-        cluster: true
-        }),
-      }),
-  ],
-});
-```
-
-or in `svelte.config.ts`:
+`svelte.config.js`:
 
 ```ts
 import adapter from '@pingpolls/svelte-adapter-bun-isr';
 
 export default {
   kit: {
-    adapter: adapter({
-      out: 'build',
-      serveAssets: true,
-      precompress: true,
-      envPrefix: '',
-      idleTimeout: 10,
-      websockets: true,
-      cluster: true
-    })
-  }
+    adapter: adapter(), // all options below are optional, these are the defaults
+  },
 };
 ```
-
-Then in the `+server.ts` or `+layout.server.ts` or `+page.server.ts` we can use:
-
-```typescript
-import type { Config } from "@pingpolls/svelte-adapter-bun-isr";
-
-export const prerender = "auto";
-export const config: Config = {
-	revalidate: 15, // In seconds, stale-while-revalidate concept
-};
-```
-
-Then build and run:
 
 ```bash
 bun run build
 bun run build/index.js
 ```
 
-`build/index.js` is always the right entry point regardless of `cluster` — it's either the server itself or the supervisor in front of it.
+`build/index.js` is always the right entry point — it's either the server itself (`cluster: false`) or a supervisor spawning one worker per core in front of it (`cluster: true`, the default).
 
-## Adapter options
+### Options
 
-### `out`
-Output directory for generated files.
+| Option | Default | Does |
+|---|---|---|
+| `out` | `'build'` | Output directory |
+| `serveAssets` | `true` | Serve client assets + prerendered pages from Bun. Set `false` if a CDN/proxy does this instead |
+| `precompress` | `true` | Emit `.gz`/`.br`/`.zst` variants at build time, negotiated via `Accept-Encoding` |
+| `envPrefix` | `''` | Prefix for runtime env vars (`HOST`, `PORT`, `SOCKET_PATH`, `IDLE_TIMEOUT`, `CPUS`, `BUN_BINARY`) |
+| `idleTimeout` | `10` | Default `Bun.serve` idle timeout in seconds (runtime env wins if set) |
+| `websockets` | `true` | Bundle `hooks.server`'s `websocket` export into `Bun.serve` |
+| `cluster` | `true` | Spawn one worker per CPU core behind `SO_REUSEPORT`. Set `false` if something else already manages process count (PM2, k8s HPA, fly.io) — running both multiplies your worker count |
 
-Default: `build`
+## Features by example
 
-### `serveAssets`
-Serve client assets and prerendered pages from Bun.
+### ISR on a page
 
-Set this to `false` if a reverse proxy or CDN serves those files instead.
+```ts
+// src/routes/isr/page/+page.server.ts
+import type { Config } from '@pingpolls/svelte-adapter-bun-isr';
 
-Default: `true`
-
-### `precompress`
-Generate compressed variants of assets during build.
-
-Creates:
-
-- `.gz`
-- `.br`
-- `.zst` when available in the Bun runtime
-
-Default: `true`
-
-### `envPrefix`
-Prefix for runtime environment variables read by the generated Bun server.
-
-Supported runtime variables:
-
-- `HOST`
-- `PORT`
-- `SOCKET_PATH`
-- `IDLE_TIMEOUT`
-
-When `cluster` is enabled, the supervisor (`index.js`) also reads two runtime variables under the same prefix:
-
-- `CPUS`
-- `BUN_BINARY`
-
-See the `cluster` option below for what they control.
-
-Default: `''`
-
-Example:
-
-```js
-adapter({
-  envPrefix: 'APP_'
-});
+export const prerender = 'auto'; // required — see "prerender: auto vs true" below
+export const config: Config = { revalidate: 15 }; // seconds
 ```
 
-Then the runtime server reads:
+The page is served straight from the prerendered file on every request. Once it's older than 15s, the *next* request still gets the current file immediately, and a fresh render happens in the background and overwrites it for the request after that (stale-while-revalidate).
 
-- `APP_HOST`
-- `APP_PORT`
-- `APP_SOCKET_PATH`
-- `APP_IDLE_TIMEOUT`
-- `APP_CPUS`
-- `APP_BUN_BINARY`
+### ISR on an endpoint (any content type)
 
-### `idleTimeout`
-Default idle timeout in seconds for `Bun.serve`.
+```ts
+// src/routes/isr/server.json/+server.ts
+import { json } from '@sveltejs/kit';
+import type { Config } from '@pingpolls/svelte-adapter-bun-isr';
 
-Runtime env still wins if the prefixed `IDLE_TIMEOUT` is set.
+export const prerender = 'auto';
+export const config: Config = { revalidate: 30 };
 
-Default: `10`
+export const GET = async () => json({ todos: await getTodos() });
+```
 
-### `cluster`
-Emit a `build/index.js` supervisor that spawns `build/app.js` across multiple worker processes, each binding the same port with `reusePort: true` (`SO_REUSEPORT`) so the kernel load-balances connections across processes/cores.
+Works identically for `+server.ts` endpoints — CSV, JSON, plain text, whatever `Content-Type` your handler sets is what gets served back on every subsequent request, not just `text/html`.
 
-Worker count and binary are resolved at runtime, not at build time:
+### Dynamic ISR routes
 
-- **Worker count** — `${envPrefix}CPUS` env var if set (must be a positive integer), otherwise `navigator.hardwareConcurrency`, otherwise `os.cpus().length`, otherwise `1`. Resolved on the machine that runs the server, not the machine that built it, so a CI build with fewer cores than production still scales correctly.
-- **Bun binary** — `${envPrefix}BUN_BINARY` env var if set (path or a name resolved via `PATH`), otherwise `process.execPath` (the exact binary the supervisor is currently running under).
+```ts
+// src/routes/isr/[slug]/+page.server.ts
+import type { Config } from '@pingpolls/svelte-adapter-bun-isr';
 
-If a worker crashes, the supervisor respawns it automatically. `SIGINT`/`SIGTERM` sent to the supervisor are forwarded to all workers for a clean shutdown.
+export const prerender = 'auto';
+export const config: Config = { revalidate: 60 };
+export const entries = async () => (await getSlugs()).map((slug) => ({ slug }));
+```
 
-Set this to `false` if something else already manages process count — PM2 `-i max`, k8s replicas/HPA, fly.io machines-per-core, etc. With `cluster: false`, `build/index.js` is the server directly (no `app.js`, no spawning), the same as running a single worker. Running the supervisor *and* an external process manager at the same time multiplies your worker count by both — pick one.
+`entries()` is what SvelteKit itself already uses to know which params to prerender at build time — this adapter reuses it for manual regeneration too (see below).
 
-Default: `true`
+### Manual regeneration
+
+```ts
+// src/routes/api/regenerate/+server.ts
+import { json } from '@sveltejs/kit';
+import { regenerate } from '@pingpolls/svelte-adapter-bun-isr';
+import type { RequestHandler } from './$types';
+
+export const POST: RequestHandler = async ({ request }) => {
+  const { paths = [], removePaths = [] } = await request.json();
+  return json(await regenerate(paths, removePaths));
+};
+```
+
+```ts
+import { regenerate, type RegenerateResult } from '@pingpolls/svelte-adapter-bun-isr';
+
+// concrete paths
+const result: RegenerateResult = await regenerate(['/isr/page', '/isr/server.json'], ['/isr/stale-item']);
+
+// a dynamic route's id instead of a concrete path expands every entries() param set
+await regenerate(['/isr/[slug]']);
+```
+
+`regenerate()` only works from inside a request while the built server is actually running (it throws otherwise). `RegenerateResult`:
+
+```ts
+interface RegenerateResult {
+  regenerated: string[]; // existing paths re-rendered in place
+  created: string[];     // brand-new paths written for the first time
+  removed: string[];     // paths deleted (from removePaths)
+  failed: { path: string; reason: string }[];
+}
+```
 
 ### WebSockets
-
-Bun WebSockets are wired up through two pieces:
-
-1. an `export const websocket` in `src/hooks.server.ts` — this is the
-   `Bun.WebSocketHandler` (`open`/`message`/`close`/`drain`) passed straight
-   into `Bun.serve`. The adapter detects and bundles this export at build
-   time (set `websockets: false` to skip it for plain HTTP apps).
-2. a call to `event.platform.server.upgrade(event.platform.request)` at the
-   point you want to upgrade the connection — either globally in `handle`,
-   or per-route in a `+server.ts`. This is the actual trigger; without it
-   the request just resolves as a normal HTTP response.
-
-#### Global upgrade via `hooks.server.ts`
 
 ```ts
 // src/hooks.server.ts
@@ -237,30 +148,14 @@ export const handle: Handle = async ({ event, resolve }) => {
 };
 
 export const websocket: Bun.WebSocketHandler<undefined> = {
-  open(ws) {
-    ws.send('connected');
-  },
-  message(ws, message) {
-    ws.send(message); // echo
-  },
+  open(ws) { ws.send('connected'); },
+  message(ws, message) { ws.send(message); }, // echo
 };
 ```
 
-#### Per-route upgrade via `+server.ts`
+Or upgrade per-route from a `+server.ts` with `platform.server.upgrade(platform.request)` instead of doing it globally in `hooks.server.ts` — either way works, since only the dynamic-SSR fallback ever reaches `platform.server`/`platform.request`.
 
-```ts
-// src/routes/ws/+server.ts
-import type { RequestHandler } from './$types';
-
-export const GET: RequestHandler = ({ platform }) => {
-  const upgraded = platform?.server?.upgrade(platform?.request);
-  return upgraded ? new Response(null, { status: 101 }) : new Response('Upgrade failed', { status: 500 });
-};
-```
-
-Either pattern works because ISR/static-asset requests never reach `server.respond()` — only the dynamic-SSR fallback (step 4 in "Runtime serving order") does, and that's exactly where `platform.server`/`platform.request` are injected.
-
-#### Types
+Types:
 
 ```ts
 // src/app.d.ts
@@ -275,132 +170,25 @@ declare global {
 export {};
 ```
 
-Bun's pub/sub API works the same way as everywhere else — `ws.subscribe('room')` / `ws.publish(...)` inside the `websocket` handlers, or `event.platform.server.publish('room', data)` from any hook or `+server.ts`.
+Bun's pub/sub works as usual — `ws.subscribe('room')` / `ws.publish(...)`, or `event.platform.server.publish('room', data)` from any hook or `+server.ts`.
 
-### Important
+## `prerender: 'auto'` vs `true`
 
-`revalidate` only applies to prerendered routes.
+Use `'auto'`, not `true`, on any route you want ISR on. `true` strips the route from SvelteKit's SSR manifest entirely, and this adapter regenerates content by calling into that same SSR manifest at runtime — a route that isn't in it can't be regenerated. With `prerender = true`, `revalidate` is silently a no-op.
 
-Use `export const prerender = 'auto'`, not `true`.
-
-Why:
-
-- `true` fully removes the route from the SSR manifest
-- the adapter uses `server.respond()` at runtime to regenerate HTML
-- if the route is stripped from the manifest, runtime regeneration cannot match it
-
-If you use `prerender = true`, the adapter warns and ISR becomes a no-op for that route.
-
-## How ISR works
-
-For each prerendered path with a positive `revalidate` value:
-
-- the adapter records the path in `manifest.js`
-- the generated Bun server starts an interval timer
-- when the timer fires, the server calls `server.respond()` for that route
-- successful HTML responses are cached in memory
-- later requests return the cached HTML instead of the build-time file
-
-Notes:
-
-- the cache is in-memory only
-- cache contents reset on process restart
-- stale build-time content still works as fallback
-- under `cluster: true`, each worker process keeps its own independent ISR cache — this is harmless (worst case is duplicated regeneration work across workers) but worth knowing if you need revalidation timing to line up exactly across cores
-
-## Manual regeneration
-
-Beyond time-based `revalidate`, you can trigger regeneration on demand from inside a running request (e.g. a webhook handler) by importing `regenerate` from the adapter package:
-
-```ts
-// src/routes/api/regenerate/+server.ts
-import { json } from '@sveltejs/kit';
-import { regenerate } from '@pingpolls/svelte-adapter-bun-isr';
-import type { RequestHandler } from './$types';
-
-export const POST: RequestHandler = async ({ request }) => {
-	const { paths = [], removePaths = [] } = await request.json();
-	const result = await regenerate(paths, removePaths);
-	return json(result);
-};
-```
-
-```ts
-import { regenerate, type RegenerateResult } from '@pingpolls/svelte-adapter-bun-isr';
-
-const result: RegenerateResult = await regenerate(
-	['/isr/page', '/isr/server.json'], // paths (or route ids, see below) to re-render
-	['/isr/stale-item'],                // paths to delete from the prerendered cache
-);
-```
-
-`regenerate()` only works while `build/app.js` (or `build/index.js` with `cluster: false`) is actually running, and only when called from inside a request — it looks up a runtime registry that's populated by the generated server, so calling it outside a live server throws.
-
-`RegenerateResult` shape:
-
-```ts
-interface RegenerateResult {
-	regenerated: string[];                          // existing prerendered paths re-rendered in place
-	created: string[];                               // brand-new paths written for the first time
-	removed: string[];                                // paths deleted (from removePaths)
-	failed: { path: string; reason: string }[];       // anything that didn't work, with why
-}
-```
-
-### Dynamic ISR routes (`[slug]`, `[id]`, etc.)
-
-For a prerendered dynamic route (e.g. `src/routes/isr/[slug]/+page.server.ts` with `prerender = 'auto'` and a `+page.server.ts`/`+page.ts` `entries()` export), pass the route's **id** — not a concrete path — to `regenerate()`:
-
-```ts
-await regenerate(['/isr/[slug]']);
-```
-
-The adapter resolves `entries()` for that route's `+page` node at request time, expands every returned param set into a concrete path (e.g. `/isr/hello-world`), and regenerates each one individually. Each concrete path is reported separately in `regenerated`/`created`/`failed`. If the route's node has no `entries()` (or it returns nothing), the call is a no-op for that id — it does not error.
-
-Concrete paths (e.g. `/isr/todo/42`) can still be passed directly instead of the route id — that regenerates just the one path without invoking `entries()`.
-
-## Precompression behavior
-
-When `precompress` is enabled, the adapter scans:
-
-- client assets
-- prerendered output
-
-It skips files that are already compressed or are not worth recompressing, including:
-
-- `.gz`
-- `.br`
-- `.zst`
-- images
-- fonts
-- media archives
-
-Compression variants are negotiated at runtime using `Accept-Encoding`.
-
-## Runtime serving order
-
-The generated Bun server resolves requests in this order:
+## How requests are resolved
 
 1. Static client assets
-2. ISR cached HTML
-3. Prerendered pages
-4. Dynamic SSR
+2. Prerendered/ISR files — the in-memory index (built at boot, updated on every regenerate/remove) maps the path straight to its file on disk; file *bytes* are still read fresh from disk per request, only the lookup is O(1) in memory. A background regeneration is kicked off first if the file is older than its `revalidate` window
+3. A path under an ISR-enabled route that has no prerendered file yet
+4. Everything else — normal SvelteKit SSR
 
-## Websocket support
+### Where this differs from stock SvelteKit
 
-If `websockets` is enabled and `src/hooks.server.ts` or `src/hooks.server.js` exports `websocket`, the adapter bundles that export and passes it to `Bun.serve`.
+- **Step 3 is the one real difference.** A path that matches an ISR-enabled route but has never been rendered (e.g. a fresh dynamic slug not covered by `entries()` at build time, and not yet regenerated on demand) gets a **404 immediately**, with rendering kicked off in the background for the *next* request — it does not block the current request on a live SSR render the way an ordinary SvelteKit dynamic route would. Call `regenerate()` (or wait for the request-after-next) once you know the path exists.
+- **Steps 1–3 use their own route matcher**, not SvelteKit's router, purely to decide "is this path governed by an ISR route." It mirrors SvelteKit's own specificity rules (static segments > matched params > plain params > rest params), so the outcome never disagrees with SvelteKit — it only exists to make that decision without going through full SSR. Step 4 hands off to SvelteKit's real router unchanged.
 
-Example:
-
-```ts
-export const websocket = {
-  async message(ws, message) {
-    ws.send(message);
-  }
-};
-```
-
-## File layout produced by the adapter
+## File layout
 
 ```text
 build/
@@ -409,38 +197,39 @@ build/
   server/
     manifest.js
     index.js
-    hooks.js   # only when websocket export is bundled
-    chunks/
-    entries/
-    nodes/
-    .vite/
+    hooks.js   # only when a websocket export is bundled
+    chunks/ entries/ nodes/ .vite/
   app.js       # only when cluster is enabled — the actual server
   index.js     # supervisor when cluster is enabled, otherwise the server
 ```
 
 ## Caveats
 
-- ISR cache is memory-only, and per-process under `cluster: true`
-- ISR depends on prerendered routes being kept in the SSR manifest
-- `prerender = 'auto'` is required for ISR routes
-- precompressed variants are best effort for `zst`
-- if `serveAssets` is disabled, static asset serving is expected elsewhere
-- `cluster: true` and an external process manager both managing worker count will multiply concurrency — use one or the other
-- manual `regenerate()` for a dynamic route id (e.g. `/isr/[slug]`) depends on that route's `+page` node exporting `entries()` — without it, the call silently no-ops for that id
+- The prerendered-path index is per-process; under `cluster: true` each worker rebuilds it independently at boot, but they all read/write the same files on disk, so staleness is briefly worker-local at worst
+- `prerender = 'auto'` is required for ISR — see above
+- `.zst` precompression is best-effort (skipped if unsupported by the running Bun build)
+- Manual `regenerate()` on a dynamic route id needs that route's `entries()` export — without it, the call no-ops for that id rather than erroring
+- `cluster: true` plus an external process manager both managing worker count will multiply concurrency — use one or the other
 
-## Development notes
+## Benchmarked performance
 
-This adapter uses:
+Load-tested with `wrk` (15s, 12 threads, 512 connections) against `svelte-adapter-bun` on identical hardware.
 
-- Node.js file system and path helpers
-- Bun build APIs
-- Bun's process spawning APIs for clustering
-- SvelteKit adapter APIs
-- generated manifest metadata for prerendered paths and ISR revalidate mapping
+![Throughput comparison: svelte-adapter-bun vs @pingpolls/svelte-adapter-bun-isr](https://raw.githubusercontent.com/pingpolls/svelte-adapter-bun-isr/refs/heads/main/benchmark/throughput.webp)
+
+![Latency comparison: svelte-adapter-bun vs @pingpolls/svelte-adapter-bun-isr](https://raw.githubusercontent.com/pingpolls/svelte-adapter-bun-isr/refs/heads/main/benchmark/latency.webp)
+
+| Mode | svelte-adapter-bun | this adapter | Improvement |
+|---|---|---|---|
+| SSR, no caching | 7,516 req/s · 67.08ms avg | 32,451 req/s · 15.72ms avg | 4.3x throughput, 4.3x lower latency |
+| SSG, prerendered | 64,208 req/s · 7.84ms avg | 300,057 req/s · 1.69ms avg | 4.7x throughput, 4.6x lower latency |
+| ISR, prerendered + revalidation | — | 299,767 req/s · 1.69ms avg | matches static prerender speed |
+
+> The SSR gap comes almost entirely from built-in clustering, not raw per-core speed — single-core SSR throughput between the two adapters is comparable. `cluster: true` (default) spawns one worker per CPU core via `reusePort` automatically; pin the count with the `CPUS` env var if needed.
 
 ## Contributing
 
-See our [Github](https://github.com/pingpolls/svelte-adapter-bun-isr)
+See [GitHub](https://github.com/pingpolls/svelte-adapter-bun-isr).
 
 ## License
 
