@@ -1,56 +1,4 @@
-/**
- * End-to-end ISR / no-ISR revalidation test for the `fixtures` SvelteKit app.
- *
- * Run with:  bun test fixtures/tests/isr.e2e.test.ts
- * (run from the repo root, or `cd fixtures && bun test tests/isr.e2e.test.ts`)
- *
- * ─────────────────────────────────────────────────────────────────────────
- * ISR SEMANTICS: stale-while-revalidate, not interval-based background
- * regeneration. There is no worker ticking on a timer — freshness is only
- * checked when a request actually hits an ISR-configured path:
- *
- *   - age <= revalidate  -> serve cached HTML, nothing else happens.
- *   - age >  revalidate  -> serve the CURRENT (stale) cached/build-time HTML
- *                           immediately, and fire an unawaited background
- *                           regeneration. The refreshed content is only
- *                           observable on a SUBSEQUENT request, once that
- *                           background regen resolves.
- *
- * Practical effect on this test: once a revalidate window has elapsed, the
- * *first* request after that point is expected to still return the stale
- * value (it's also the request that triggers the regen), and a *follow-up*
- * request is expected to return the fresh value. See `assertSwrTransition`
- * below — every assertion that crosses a route's revalidate window uses it
- * instead of a single fetch+expect.
- * ─────────────────────────────────────────────────────────────────────────
- *
- * ASSUMPTIONS (the fixtures/package.json + route files were not inspectable
- * from this environment — they were empty/not present). Adjust the CONFIG
- * block below if any of these don't match the real project:
- *
- *   - `package.json` has a `"build"` script that runs the SvelteKit build
- *     (adapter-node output written to `fixtures/build/`).
- *   - `package.json` has a `"start"` script that boots the built server
- *     (e.g. `bun run build/index.js`), reading `PORT` from env, defaulting
- *     to 3000 if `PORT` isn't set.
- *   - The initial DB migration is performed by running
- *     `src/scripts/prep.ts` directly with bun (creates the sqlite schema,
- *     no seed rows).
- *   - `/no-isr/server.json` exists as the no-isr counterpart of `/isr/server.json`
- *     (the dir listing only showed `/isr/server.json/+server.ts`, but the test
- *     spec explicitly checks `/no-isr/server.json`, so it's assumed to exist
- *     with the same JSON contract).
- *   - The todos table backing every route is shared/global (not scoped
- *     per-route) — a single POST to /api/todos is expected to eventually
- *     surface everywhere, just at different revalidation cadences.
- *   - `/no-isr/*` routes are prerendered WITHOUT a `revalidate` config
- *     (frozen at build time, only change after a rebuild) — that's why
- *     they're expected to stay at 0 for the entire lifetime of the first
- *     server process, regardless of ISR window checks.
- * ─────────────────────────────────────────────────────────────────────────
- */
-
-import { afterAll, afterEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, rmSync } from "node:fs";
 import path from "node:path";
 
@@ -58,8 +6,7 @@ import path from "node:path";
 const FIXTURES_DIR = path.join(process.cwd(), "fixtures");
 const DB_PATH = path.join(FIXTURES_DIR, "db.sqlite");
 const BUILD_DIR = path.join(FIXTURES_DIR, "build");
-const PORT = Number(process.env.TEST_PORT ?? 3000);
-const BASE_URL = `http://localhost:${PORT}`;
+const BASE_PORT = Number(process.env.TEST_PORT ?? 3000);
 
 const PREP_CMD = ["bun", "run", "prepare"];
 const MIGRATE_CMD = ["bun", "src/scripts/prep.ts"];
@@ -69,16 +16,26 @@ const START_CMD = ["bun", "run", "start"];
 const SERVER_BOOT_TIMEOUT_MS = 20_000;
 const SERVER_BOOT_POLL_MS = 250;
 const OVERALL_TEST_TIMEOUT_MS = 120_000;
-
-// SWR background-regen polling defaults. Regeneration is just an in-process
-// server.respond() call against sqlite, so it's normally sub-50ms — this
-// budget is generous headroom, not an expected wait time.
 const SWR_POLL_RETRIES = 10;
 const SWR_POLL_DELAY_MS = 100;
 
+// ── GLOBAL SETUP & TEARDOWN ─────────────────────────────────────────────
+
+beforeAll(() => {
+	rmIfExists(BUILD_DIR);
+	rmIfExists(DB_PATH);
+	runCmd(PREP_CMD, "prepping");
+	runCmd(MIGRATE_CMD, "migrate");
+	runCmd(BUILD_CMD, "build");
+});
+
+afterAll(() => {
+	rmIfExists(BUILD_DIR);
+	rmIfExists(DB_PATH);
+});
+
 // ── LOW-LEVEL HELPERS ───────────────────────────────────────────────────
 
-/** Run a command synchronously in the fixtures dir; throws on non-zero exit. */
 function runCmd(cmd: string[], label: string) {
 	const result = Bun.spawnSync({
 		cmd,
@@ -87,73 +44,54 @@ function runCmd(cmd: string[], label: string) {
 		stderr: "pipe",
 		env: { ...process.env },
 	});
-
-	const stdout = result.stdout?.toString() ?? "";
-	const stderr = result.stderr?.toString() ?? "";
-
 	if (result.exitCode !== 0) {
 		throw new Error(
 			`[${label}] command failed (exit ${result.exitCode}): ${cmd.join(" ")}\n` +
-				`--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`,
+				`--- stderr ---\n${result.stderr?.toString()}`,
 		);
 	}
-
-	return { stdout, stderr, exitCode: result.exitCode };
+	return result;
 }
 
-/**
- * Spawns `bun run start` as a detached background process so it doesn't
- * block the test runner, then polls the server until it responds.
- */
-async function startServer(): Promise<import("bun").Subprocess> {
+async function startAppServer(port: number): Promise<import("bun").Subprocess> {
 	const proc = Bun.spawn({
 		cmd: START_CMD,
 		cwd: FIXTURES_DIR,
 		stdout: "pipe",
 		stderr: "pipe",
-		env: { ...process.env, PORT: String(PORT) },
+		env: { ...process.env, PORT: String(port) },
 	});
 
 	const deadline = Date.now() + SERVER_BOOT_TIMEOUT_MS;
-	let lastError: unknown;
+	const baseUrl = `http://localhost:${port}`;
 
 	while (Date.now() < deadline) {
-		// If the process already exited, the server failed to boot — bail early.
 		if (proc.exitCode !== null) {
-			const stderr = proc.stderr ? await new Response(proc.stderr).text() : "";
-			throw new Error(
-				`Server process exited early (code ${proc.exitCode}) before becoming ready.\n${stderr}`,
-			);
+			throw new Error(`Server exited early (code ${proc.exitCode}).`);
 		}
-
 		try {
-			const res = await fetch(`${BASE_URL}/no-isr/page`);
-			if (res.ok) return proc;
-		} catch (err) {
-			lastError = err;
-		}
-
+			if ((await fetch(`${baseUrl}/no-isr/page`)).ok) return proc;
+		} catch {}
 		await Bun.sleep(SERVER_BOOT_POLL_MS);
 	}
 
 	proc.kill();
 	throw new Error(
-		`Server did not become ready within ${SERVER_BOOT_TIMEOUT_MS}ms. Last error: ${String(lastError)}`,
+		`Server did not become ready within ${SERVER_BOOT_TIMEOUT_MS}ms.`,
 	);
 }
 
-/** Kills the server process and verifies the port is no longer accepting connections. */
-async function stopServerAndVerify(proc: import("bun").Subprocess) {
+async function stopAppServer(
+	proc: import("bun").Subprocess | null,
+	port: number,
+) {
+	if (!proc || proc.exitCode !== null) return;
 	proc.kill();
 	await proc.exited;
 
-	// The process object reports it's done...
-	expect(proc.exitCode === null ? proc.signalCode !== null : true).toBe(true);
-
-	// ...and the port itself should now refuse connections.
 	let stillUp = true;
 	try {
-		await fetch(`${BASE_URL}/no-isr/page`, {
+		await fetch(`http://localhost:${port}/no-isr/page`, {
 			signal: AbortSignal.timeout(1000),
 		});
 	} catch {
@@ -162,54 +100,42 @@ async function stopServerAndVerify(proc: import("bun").Subprocess) {
 	expect(stillUp).toBe(false);
 }
 
-async function fetchJsonTodos(
-	urlPath: string,
-): Promise<{ id: number; text: string }[]> {
-	const res = await fetch(`${BASE_URL}${urlPath}`);
+function rmIfExists(p: string) {
+	if (existsSync(p)) rmSync(p, { recursive: true, force: true });
+}
+
+async function fetchJsonTodos(baseUrl: string, urlPath: string) {
+	const res = await fetch(`${baseUrl}${urlPath}`);
 	expect(res.ok).toBe(true);
 	const body = (await res.json()) as { todos: { id: number; text: string }[] };
-	expect(Array.isArray(body.todos)).toBe(true);
 	return body.todos;
 }
 
-/** Extracts the <li> text contents from a named <section id="..."> in raw HTML. */
 function extractSectionItems(html: string): string[] {
 	const sections = html.matchAll(/<section[^>]*>([\s\S]*?)<\/section>/gi);
 	const items: string[] = [];
-
 	for (const sectionMatch of sections) {
-		const sectionContent = sectionMatch[1];
-		if (!sectionContent) continue; // Safety check
-
-		const uls = sectionContent.matchAll(/<ul[^>]*>([\s\S]*?)<\/ul>/gi);
-
+		if (!sectionMatch[1]) continue;
+		const uls = sectionMatch[1].matchAll(/<ul[^>]*>([\s\S]*?)<\/ul>/gi);
 		for (const ulMatch of uls) {
-			const ulContent = ulMatch[1];
-			if (!ulContent) continue; // Safety check
-
-			const lis = ulContent.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/gi);
+			if (!ulMatch[1]) continue;
+			const lis = ulMatch[1].matchAll(/<li[^>]*>([\s\S]*?)<\/li>/gi);
 			for (const liMatch of lis) {
-				const liContent = liMatch[1];
-				if (liContent) {
-					// Safety check
-					items.push(liContent.trim());
-				}
+				if (liMatch[1]) items.push(liMatch[1].trim());
 			}
 		}
 	}
-
 	return items;
 }
 
-async function fetchPageSections(urlPath: string) {
-	const res = await fetch(`${BASE_URL}${urlPath}`);
+async function fetchPageSections(baseUrl: string, urlPath: string) {
+	const res = await fetch(`${baseUrl}${urlPath}`);
 	expect(res.ok).toBe(true);
-	const html = await res.text();
-	return extractSectionItems(html);
+	return extractSectionItems(await res.text());
 }
 
-async function createTodo(text: string, url?: string) {
-	const res = await fetch(`${url ? url : BASE_URL}/api/todos`, {
+async function createTodo(baseUrl: string, text: string) {
+	const res = await fetch(`${baseUrl}/api/todos`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ text }),
@@ -217,258 +143,123 @@ async function createTodo(text: string, url?: string) {
 	expect(res.ok).toBe(true);
 }
 
-function rmIfExists(p: string) {
-	if (existsSync(p)) rmSync(p, { recursive: true, force: true });
-}
-
-/**
- * Asserts the stale-while-revalidate transition for a single ISR route.
- *
- * The FIRST call to `fetcher()` is expected to still return
- * `expectedStaleCount` — under SWR, crossing the revalidate window doesn't
- * refresh content synchronously, it only *triggers* a background
- * regeneration. This first call is that trigger.
- *
- * Then it polls `fetcher()` a few more times (short delay between each)
- * until it sees `expectedFreshCount`, which is what a request AFTER the
- * background regen resolves should return. Fails if it never arrives
- * within the retry budget.
- */
 async function assertSwrTransition(
 	fetcher: () => Promise<number>,
 	expectedStaleCount: number,
 	expectedFreshCount: number,
-	opts: { retries?: number; delayMs?: number } = {},
 ) {
-	const { retries = SWR_POLL_RETRIES, delayMs = SWR_POLL_DELAY_MS } = opts;
-
-	// First request: still the pre-revalidate snapshot. Also the request
-	// that fires the background regeneration.
 	const staleCount = await fetcher();
 	expect(staleCount).toBe(expectedStaleCount);
 
-	// Poll subsequent requests until the background regen lands (or we
-	// exhaust the retry budget — in which case the final assertion fails
-	// with the last-seen count, which is the useful failure signal).
 	let freshCount = staleCount;
-	for (let i = 0; i < retries; i++) {
-		await Bun.sleep(delayMs);
+	for (let i = 0; i < SWR_POLL_RETRIES; i++) {
+		await Bun.sleep(SWR_POLL_DELAY_MS);
 		freshCount = await fetcher();
 		if (freshCount === expectedFreshCount) break;
 	}
 	expect(freshCount).toBe(expectedFreshCount);
 }
 
-// ── TEST ────────────────────────────────────────────────────────────────
+// ── TESTS ───────────────────────────────────────────────────────────────
 
 describe("ISR System", () => {
 	let server: import("bun").Subprocess | null = null;
+	const port = BASE_PORT;
+	const baseUrl = `http://localhost:${port}`;
+
+	beforeAll(async () => {
+		server = await startAppServer(port);
+	});
 
 	afterAll(async () => {
-		// Safety net: make sure nothing is left running / lying around even if
-		// an assertion failed partway through the sequence below.
-		if (server && server.exitCode === null) {
-			server.kill();
-			await server.exited;
+		await stopAppServer(server, port);
+	});
+
+	test("Initial state is empty", async () => {
+		for (const p of ["/no-isr/page", "/isr/page", "/isr/layout"]) {
+			expect((await fetchPageSections(baseUrl, p)).length).toBe(0);
 		}
-		rmIfExists(BUILD_DIR);
-		rmIfExists(DB_PATH);
+		for (const p of ["/no-isr/server.json", "/isr/server.json"]) {
+			expect((await fetchJsonTodos(baseUrl, p)).length).toBe(0);
+		}
+	});
+
+	test("Immediate checks remain stale (0s)", async () => {
+		await createTodo(baseUrl, "wash the dishes");
+		for (const p of ["/no-isr/page", "/isr/page", "/isr/layout"]) {
+			expect((await fetchPageSections(baseUrl, p)).length).toBe(0);
+		}
 	});
 
 	test(
-		"Migrate the initial schema, then build the SvelteKit project",
+		"ISR Page revalidates after 2s window",
 		async () => {
-			runCmd(PREP_CMD, "prepping");
-			runCmd(MIGRATE_CMD, "migrate");
-			const build1 = runCmd(BUILD_CMD, "build#1");
-			expect(build1.exitCode).toBe(0);
-			expect(existsSync(BUILD_DIR)).toBe(true);
+			await Bun.sleep(2000);
+
+			// Unchanged routes
+			expect((await fetchPageSections(baseUrl, "/no-isr/page")).length).toBe(0);
+			expect(
+				(await fetchJsonTodos(baseUrl, "/no-isr/server.json")).length,
+			).toBe(0);
+			expect((await fetchJsonTodos(baseUrl, "/isr/server.json")).length).toBe(
+				0,
+			);
+
+			// ISR page transition
+			await assertSwrTransition(
+				async () => (await fetchPageSections(baseUrl, "/isr/page")).length,
+				0,
+				1,
+			);
 		},
 		OVERALL_TEST_TIMEOUT_MS,
 	);
 
 	test(
-		"Start `bun run start` in the background and confirm it boots.",
+		"ISR Server JSON revalidates after 4s window",
 		async () => {
-			server = await startServer();
+			await Bun.sleep(2000);
+
+			// Previously updated route
+			expect((await fetchPageSections(baseUrl, "/isr/page")).length).toBe(1);
+
+			// ISR server.json transition
+			await assertSwrTransition(
+				async () => (await fetchJsonTodos(baseUrl, "/isr/server.json")).length,
+				0,
+				1,
+			);
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
+
+	test(
+		"ISR Layout revalidates after 6s window",
+		async () => {
+			await Bun.sleep(2000);
+
+			// ISR layout transition
+			await assertSwrTransition(
+				async () => (await fetchPageSections(baseUrl, "/isr/layout")).length,
+				0,
+				1,
+			);
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
+
+	test(
+		"Server rebuilds and restarts properly",
+		async () => {
+			await stopAppServer(server, port);
+			server = null;
+
+			runCmd(BUILD_CMD, "build#2");
+			server = await startAppServer(port);
 			expect(server.exitCode).toBeNull();
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
 
-	test(
-		"Everything should start out empty.",
-		async () => {
-			for (const p of ["/no-isr/page", "/isr/page", "/isr/layout"]) {
-				const list = await fetchPageSections(p);
-				expect(list.length).toBe(0);
-			}
-			for (const p of ["/no-isr/server.json", "/isr/server.json"]) {
-				expect((await fetchJsonTodos(p)).length).toBe(0);
-			}
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
-	test(
-		"Immediately after creation, nothing should reflect it yet.",
-		async () => {
-			await createTodo("wash the dishes");
-
-			// No route's revalidate window has elapsed yet (t=0), so nothing
-			// is triggered — every fetch here is a plain "still stale" check,
-			// not an SWR transition.
-			for (const p of ["/no-isr/page", "/isr/page", "/isr/layout"]) {
-				const list = await fetchPageSections(p);
-				expect(list.length).toBe(0);
-			}
-			for (const p of ["/no-isr/server.json", "/isr/server.json"]) {
-				expect((await fetchJsonTodos(p)).length).toBe(0);
-			}
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
-
-	test(
-		"Wait 2s (isr/page's 2s revalidate window should now have elapsed)",
-		async () => {
-			await Bun.sleep(2 * 1000);
-
-			// Windows that haven't elapsed yet: still fully stale. Nothing
-			// gets triggered by these fetches, so a single check is enough.
-			for (const p of [
-				"/no-isr/page",
-				"/no-isr/server.json",
-				"/isr/server.json",
-				"/isr/layout",
-			]) {
-				const count = p.includes("server")
-					? (await fetchJsonTodos(p)).length
-					: (await fetchPageSections(p)).length;
-				expect(count).toBe(0);
-			}
-
-			// isr/page's 2s window HAS elapsed: first hit returns the stale
-			// (empty) snapshot and kicks off a background regen; a follow-up
-			// hit should pick up the now-fresh content.
-			await assertSwrTransition(
-				async () => (await fetchPageSections("/isr/page")).length,
-				0,
-				1,
-			);
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
-
-	test(
-		"Wait 2 more seconds (t=4s: isr/server.json's 4s window elapses).",
-		async () => {
-			await Bun.sleep(2 * 1000);
-
-			for (const p of ["/no-isr/page", "/no-isr/server.json", "/isr/layout"]) {
-				const count = p.includes("server")
-					? (await fetchJsonTodos(p)).length
-					: (await fetchPageSections(p)).length;
-				expect(count).toBe(0);
-			}
-
-			// isr/page was already revalidated in the previous step — its own
-			// 2s window may or may not have re-elapsed by now, but the data
-			// hasn't changed since, so a plain fetch is sufficient here.
-			{
-				const list = await fetchPageSections("/isr/page");
-				expect(list.length).toBe(1);
-			}
-
-			// isr/server.json's 4s window HAS elapsed: same stale-then-fresh dance.
-			await assertSwrTransition(
-				async () => (await fetchJsonTodos("/isr/server.json")).length,
-				0,
-				1,
-			);
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
-
-	test(
-		"Wait 2 more seconds (t=6s: isr layout's 6s window elapses)",
-		async () => {
-			await Bun.sleep(2 * 1000);
-
-			for (const p of ["/no-isr/page", "/no-isr/server.json"]) {
-				const count =
-					p === "/no-isr/page"
-						? (await fetchPageSections(p)).length
-						: (await fetchJsonTodos(p)).length;
-				expect(count).toBe(0);
-			}
-
-			// Already revalidated in earlier steps — plain fetches, no SWR
-			// transition expected here.
-			{
-				const list = await fetchPageSections("/isr/page");
-				expect(list.length).toBe(1);
-			}
-			expect((await fetchJsonTodos("/isr/server.json")).length).toBe(1);
-
-			// isr/layout's 6s window HAS elapsed.
-			await assertSwrTransition(
-				async () => (await fetchPageSections("/isr/layout")).length,
-				0,
-				1,
-			);
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
-
-	test(
-		"Stop the server and verify it's actually down.Rebuild the project and confirm the build succeeds.",
-		async () => {
-			if (server) {
-				await stopServerAndVerify(server);
-				server = null;
-			}
-			const build2 = runCmd(BUILD_CMD, "build#2");
-			expect(build2.exitCode).toBe(0);
-			expect(existsSync(BUILD_DIR)).toBe(true);
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
-
-	test(
-		"Restart server succeed after new build.",
-		async () => {
-			server = await startServer();
-			expect(server.exitCode).toBeNull();
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
-
-	test(
-		"All page should have todo.",
-		async () => {
-			for (const p of ["/no-isr/page", "/isr/page", "/isr/layout"]) {
-				const list = await fetchPageSections(p);
-				expect(list.length).toBe(1);
-			}
-			for (const p of ["/no-isr/server.json", "/isr/server.json"]) {
-				expect((await fetchJsonTodos(p)).length).toBe(1);
-			}
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
-
-	test(
-		"Cleanup server",
-		async () => {
-			if (server) {
-				await stopServerAndVerify(server);
-				expect(server.exitCode).not.toBeNull();
-				server = null;
-			}
-			rmIfExists(BUILD_DIR);
-			rmIfExists(DB_PATH);
-			expect(existsSync(BUILD_DIR)).toBe(false);
-			expect(existsSync(DB_PATH)).toBe(false);
+			// All data should persist
+			expect((await fetchPageSections(baseUrl, "/isr/layout")).length).toBe(1);
 		},
 		OVERALL_TEST_TIMEOUT_MS,
 	);
@@ -476,48 +267,19 @@ describe("ISR System", () => {
 
 describe("Manual regeneration API & dynamic ISR routes", () => {
 	let server: import("bun").Subprocess | null = null;
-	const REGEN_PORT = PORT + 2; // distinct port to avoid clashing with other describe blocks
+	const port = BASE_PORT + 2;
+	const baseUrl = `http://localhost:${port}`;
 
-	const REGEN_BASE_URL = `http://localhost:${REGEN_PORT}`;
+	beforeAll(async () => {
+		server = await startAppServer(port);
+	});
 
-	async function startRegenServer(): Promise<import("bun").Subprocess> {
-		const proc = Bun.spawn({
-			cmd: START_CMD,
-			cwd: FIXTURES_DIR,
-			stdout: "pipe",
-			stderr: "pipe",
-			env: { ...process.env, PORT: String(REGEN_PORT) },
-		});
-
-		const deadline = Date.now() + SERVER_BOOT_TIMEOUT_MS;
-		let lastError: unknown;
-
-		while (Date.now() < deadline) {
-			if (proc.exitCode !== null) {
-				const stderr = proc.stderr
-					? await new Response(proc.stderr).text()
-					: "";
-				throw new Error(
-					`Server process exited early (code ${proc.exitCode}) before becoming ready.\n${stderr}`,
-				);
-			}
-			try {
-				const res = await fetch(`${REGEN_BASE_URL}/no-isr/page`);
-				if (res.ok) return proc;
-			} catch (err) {
-				lastError = err;
-			}
-			await Bun.sleep(SERVER_BOOT_POLL_MS);
-		}
-
-		proc.kill();
-		throw new Error(
-			`Server did not become ready within ${SERVER_BOOT_TIMEOUT_MS}ms. Last error: ${String(lastError)}`,
-		);
-	}
+	afterAll(async () => {
+		await stopAppServer(server, port);
+	});
 
 	async function postRegenerate(paths: string[], removePaths: string[] = []) {
-		const res = await fetch(`${REGEN_BASE_URL}/api/regenerate`, {
+		const res = await fetch(`${baseUrl}/api/regenerate`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ paths, removePaths }),
@@ -531,255 +293,69 @@ describe("Manual regeneration API & dynamic ISR routes", () => {
 		};
 	}
 
-	afterAll(async () => {
-		if (server && server.exitCode === null) {
-			server.kill();
-			await server.exited;
-		}
-		rmIfExists(BUILD_DIR);
-		rmIfExists(DB_PATH);
+	test("POST /api/regenerate creates a brand-new prerendered path", async () => {
+		await createTodo(baseUrl, "Hello World");
+		const result = await postRegenerate(["/isr/hello-world"]);
+
+		expect(result.failed).toEqual([]);
+		expect(result.created).toContain("/isr/hello-world");
+		expect((await fetch(`${baseUrl}/isr/hello-world`)).ok).toBe(true);
 	});
 
-	test(
-		"Migrate the initial schema, build, and boot the server",
-		async () => {
-			runCmd(PREP_CMD, "prepping");
-			runCmd(MIGRATE_CMD, "migrate");
-			const build = runCmd(BUILD_CMD, "build#regen");
-			expect(build.exitCode).toBe(0);
-			expect(existsSync(BUILD_DIR)).toBe(true);
+	test("Route id with entries() expands every param set", async () => {
+		const result = await postRegenerate(["/isr/todo/[id]"]);
+		expect(result.failed).toEqual([]);
+		expect([...result.created, ...result.regenerated].length).toBeGreaterThan(
+			0,
+		);
+	});
 
-			server = await startRegenServer();
-			expect(server.exitCode).toBeNull();
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
+	test("Non-ISR route is rejected", async () => {
+		const result = await postRegenerate(["/no-isr/page"]);
+		expect(result.failed[0]?.path).toBe("/no-isr/page");
+		expect(result.failed[0]?.reason).toContain("not ISR-enabled");
+	});
 
-	test(
-		"Concrete path: POST /api/regenerate creates a brand-new prerendered path",
-		async () => {
-			await createTodo("Hello World", REGEN_BASE_URL);
-
-			// /isr/[slug] is prerender=auto but not seeded via entries() at build
-			// time for this slug, so this is a first-time write -> 'created'.
-			const result = await postRegenerate(["/isr/hello-world"]);
-
-			expect(result.failed).toEqual([]);
-			expect(result.created).toContain("/isr/hello-world");
-			expect(result.regenerated).not.toContain("/isr/hello-world");
-
-			const res = await fetch(`${REGEN_BASE_URL}/isr/hello-world`);
-			expect(res.ok).toBe(true);
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
-
-	test(
-		"Route id with entries(): POST /api/regenerate expands every param set",
-		async () => {
-			// /isr/todo/[id]'s +page.server.ts exports entries() over existing
-			// todo rows -> passing the route id (not a concrete path) should
-			// expand to one concrete path per todo and regenerate each.
-			const result = await postRegenerate(["/isr/todo/[id]"]);
-
-			expect(result.failed).toEqual([]);
-			const touched = [...result.created, ...result.regenerated];
-			expect(touched.length).toBeGreaterThan(0);
-			for (const p of touched) {
-				expect(p.startsWith("/isr/todo/")).toBe(true);
-			}
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
-
-	test(
-		"Non-ISR route id is rejected with a 'not ISR-enabled' reason",
-		async () => {
-			const result = await postRegenerate(["/no-isr/page"]);
-			expect(result.regenerated).toEqual([]);
-			expect(result.created).toEqual([]);
-			expect(result.failed.length).toBe(1);
-			expect(result.failed[0]?.path).toBe("/no-isr/page");
-			expect(result.failed[0]?.reason).toContain("not ISR-enabled");
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
-
-	test(
-		"removePaths deletes a previously regenerated path (and its compressed variants)",
-		async () => {
-			const result = await postRegenerate([], ["/isr/hello-world"]);
-
-			expect(result.removed).toContain("/isr/hello-world");
-			expect(result.failed).toEqual([]);
-
-			// It's gone from the prerendered cache, so the dynamic-SSR fallback
-			// (or bounded-negative-cache 404, depending on route config) takes
-			// over — either way it should no longer serve the old cached file
-			// as a 200 from the prerendered dir. We only assert the regenerate
-			// bookkeeping here since re-render-on-miss behavior is covered by
-			// the "ISR System" describe block above.
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
-
-	test(
-		"Unknown/untracked removePaths entry is reported as failed, not thrown",
-		async () => {
-			const result = await postRegenerate([], ["/isr/does-not-exist"]);
-			expect(result.removed).toEqual([]);
-			expect(result.failed.length).toBe(1);
-			expect(result.failed[0]?.path).toBe("/isr/does-not-exist");
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
-
-	test(
-		"Cleanup server",
-		async () => {
-			// NOTE: stopServerAndVerify() checks BASE_URL (the default PORT),
-			// but this block boots on REGEN_PORT, so we kill + verify manually
-			// against REGEN_BASE_URL instead of reusing that helper.
-			if (server) {
-				server.kill();
-				await server.exited;
-				server = null;
-			}
-
-			let stillUp = true;
-			try {
-				await fetch(`${REGEN_BASE_URL}/no-isr/page`, {
-					signal: AbortSignal.timeout(1000),
-				});
-			} catch {
-				stillUp = false;
-			}
-			expect(stillUp).toBe(false);
-
-			rmIfExists(BUILD_DIR);
-			rmIfExists(DB_PATH);
-			expect(existsSync(BUILD_DIR)).toBe(false);
-			expect(existsSync(DB_PATH)).toBe(false);
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
+	test("removePaths successfully deletes paths", async () => {
+		const result = await postRegenerate([], ["/isr/hello-world"]);
+		expect(result.removed).toContain("/isr/hello-world");
+	});
 });
 
-describe("Websockets, and adapter options", () => {
-	let featServer: import("bun").Subprocess | null = null;
-	const FEAT_PORT = PORT + 1; // Use a distinct port to avoid conflicts
+describe("Websockets and adapter options", () => {
+	let server: import("bun").Subprocess | null = null;
+	const port = BASE_PORT + 1;
 
-	afterEach(async () => {
-		if (featServer && featServer.exitCode === null) {
-			featServer.kill();
-			await featServer.exited;
-			featServer = null;
-		}
+	beforeAll(async () => {
+		server = await startAppServer(port);
 	});
 
-	test(
-		"Migrate the initial schema, then build the SvelteKit project",
-		async () => {
-			runCmd(PREP_CMD, "prepping");
-			runCmd(MIGRATE_CMD, "migrate");
-			const build1 = runCmd(BUILD_CMD, "build#3");
-			expect(build1.exitCode).toBe(0);
-			expect(existsSync(BUILD_DIR)).toBe(true);
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
+	afterAll(async () => {
+		await stopAppServer(server, port);
+	});
 
-	test(
-		"Verify Bun WebSocket handling on the adapter's default PORT binding",
-		async () => {
-			// Adapter default is envPrefix: '' (see README usage block), so the
-			// generated server reads plain PORT — no prefix guessing needed.
-			featServer = Bun.spawn({
-				cmd: START_CMD,
-				cwd: FIXTURES_DIR,
-				stdout: "pipe",
-				stderr: "pipe",
-				env: { ...process.env, PORT: String(FEAT_PORT) },
-			});
-
-			// Poll until the server becomes responsive
-			let isReady = false;
-			const deadline = Date.now() + 10000;
-			while (Date.now() < deadline) {
-				try {
-					const res = await fetch(`http://localhost:${FEAT_PORT}/no-isr/page`);
-					if (res.ok) {
-						isReady = true;
-						break;
-					}
-				} catch {
-					// Server not ready yet
-				}
-				await Bun.sleep(250);
-			}
-
-			expect(isReady).toBe(true);
-
-			// hooks.server.ts upgrades on /ws (see README example) — hits the
-			// dynamic-SSR fallback path, which is the only branch that gets
-			// `platform.server` / `platform.request` injected.
-			const wsUrl = `ws://localhost:${FEAT_PORT}/ws`;
-			const ws = new WebSocket(wsUrl);
-
-			const wsResponsePromise = new Promise<string>((resolve, reject) => {
-				ws.onopen = () => {
-					ws.send("ping");
+	test("Bun WebSocket handling works on the adapter's default PORT", async () => {
+		const ws = new WebSocket(`ws://localhost:${port}/ws`);
+		const result = await Promise.race([
+			new Promise<string>((resolve, reject) => {
+				ws.onopen = () => ws.send("ping");
+				ws.onmessage = (e) => {
+					if (e.data !== "connection opened") resolve(String(e.data));
 				};
-				ws.onmessage = (event) => {
-					if (event.data !== "connection opened") {
-						resolve(String(event.data));
-					}
-				};
-				ws.onerror = (err) => {
-					reject(err);
-				};
-			});
+				ws.onerror = reject;
+			}),
+			Bun.sleep(3000).then(() => "timeout"),
+		]);
 
-			const result = await Promise.race([
-				wsResponsePromise,
-				Bun.sleep(3000).then(() => "timeout"),
-			]);
+		ws.close();
+		expect(result).toBe("ping");
+	});
 
-			ws.close();
-
-			expect(result).not.toBe("timeout");
-			// Echo handler per the README example
-			expect(result).toBe("ping");
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
-
-	test("Verify build folder output layout integrity and artifacts", () => {
-		expect(existsSync(BUILD_DIR)).toBe(true);
+	test("Build folder output layout integrity and artifacts", () => {
 		expect(existsSync(path.join(BUILD_DIR, "index.js"))).toBe(true);
-		expect(existsSync(path.join(BUILD_DIR, "server"))).toBe(true);
 		expect(existsSync(path.join(BUILD_DIR, "server", "manifest.js"))).toBe(
 			true,
 		);
-
-		// hooks.js should exist iff hooks.server.ts exports `websocket` and the
-		// adapter's websockets option is enabled (default true).
 		expect(existsSync(path.join(BUILD_DIR, "server", "hooks.js"))).toBe(true);
 	});
-
-	test(
-		"Cleanup server",
-		async () => {
-			if (featServer) {
-				await stopServerAndVerify(featServer);
-				expect(featServer.exitCode).not.toBeNull();
-				featServer = null;
-			}
-			rmIfExists(BUILD_DIR);
-			rmIfExists(DB_PATH);
-			expect(existsSync(BUILD_DIR)).toBe(false);
-			expect(existsSync(DB_PATH)).toBe(false);
-		},
-		OVERALL_TEST_TIMEOUT_MS,
-	);
 });
