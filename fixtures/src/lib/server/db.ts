@@ -22,11 +22,17 @@ export function getTodos() {
 		.all() as Todo[];
 }
 
+export function getTodo(id: number) {
+	return db.prepare(`SELECT id, text FROM todos WHERE id = ?`).all(id).at(0) as
+		| Todo
+		| undefined;
+}
+
 /**
  * Clears all todo items.
  */
 export function clearTodos() {
-	db.run("DELETE FROM todos");
+	db.run("DELETE FROM todos; delete from sqlite_sequence where name='todos';");
 }
 
 export { db };

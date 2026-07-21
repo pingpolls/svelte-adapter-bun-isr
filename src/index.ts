@@ -39,43 +39,53 @@ interface AdapterOptions {
 	/**
 	 * Emit a `build/index.js` supervisor that spawns `build/app.js` across
 	 * multiple worker processes (bound with SO_REUSEPORT) for multi-core
-	 * throughput. Worker count and binary are resolved entirely at
-	 * runtime — see the `${envPrefix}CPUS` / `${envPrefix}BUN_BINARY` env
-	 * vars documented on the generated supervisor.
-	 *
-	 * Set false if something else already manages process count (PM2
-	 * `-i max`, k8s replicas/HPA, fly.io machines-per-core, etc.) — in
-	 * that case `build/index.js` IS the server directly, same as before
-	 * this option existed. Running the supervisor *and* an external
-	 * process manager at once will multiply your worker count by both,
-	 * so pick one. Default: true
+	 * throughput.
 	 */
 	cluster?: boolean;
 }
 
-/**
- * Adapter-specific route config. Use it via SvelteKit's own `export const config` page option
- * in +page.server.ts / +page.ts (or the +layout equivalents to apply it to a whole subtree):
- *
- * ```ts
- * import type { Config } from '@pingpolls/svelte-adapter-bun-isr';
- *
- * export const prerender = 'auto'; // NOT `true` — see note below
- * export const config: Config = { revalidate: 5 }; // Sec
- * ```
- *
- * `revalidate` only has an effect on routes that are also prerendered. Use
- * `export const prerender = 'auto'`, not `true`: SvelteKit strips fully-prerendered
- * (`true`) routes from the SSR manifest entirely, so there'd be nothing left for the
- * adapter's stale-while-revalidate check to re-render at runtime. `'auto'` still produces
- * the static file at build time, but keeps the route reachable via `server.respond()` for
- * regeneration.
- */
 export interface Config {
 	revalidate?: number;
 }
 
+export interface RegenerateResult {
+	/** Existing prerendered paths whose load function was re-run and file rewritten. */
+	regenerated: string[];
+	/** Brand-new paths written for the first time (via entries() or a fresh explicit path). */
+	created: string[];
+	/** Paths whose prerendered file (+ compressed variants) were deleted. */
+	removed: string[];
+	/** Anything that didn't work, with a reason. */
+	failed: { path: string; reason: string }[];
+}
+
 const ADAPTER_NAME = "@pingpolls/svelte-adapter-bun-isr";
+const REGISTRY_SYMBOL_KEY = `${ADAPTER_NAME}/registry`;
+
+export function regenerate(
+	paths: string[],
+	removePaths: string[] = [],
+): Promise<RegenerateResult> {
+	const registry = (
+		globalThis as unknown as Record<
+			string,
+			| { regenerate: (p: string[], r: string[]) => Promise<RegenerateResult> }
+			| undefined
+		>
+	)[REGISTRY_SYMBOL_KEY as unknown as string] as
+		| { regenerate: (p: string[], r: string[]) => Promise<RegenerateResult> }
+		| undefined;
+
+	if (!registry) {
+		throw new Error(
+			`[${ADAPTER_NAME}] regenerate() has no runtime server to talk to. This only works ` +
+				"while build/app.js (or build/index.js with cluster:false) is actually running, " +
+				"called from inside a request — e.g. a +server.ts endpoint.",
+		);
+	}
+
+	return registry.regenerate(paths, removePaths);
+}
 
 export default function (options: AdapterOptions = {}): Adapter {
 	const {
@@ -95,9 +105,6 @@ export default function (options: AdapterOptions = {}): Adapter {
 			const dest = join(process.cwd(), out);
 			const tmp = builder.getBuildDirectory("adapter-bun");
 
-			// Wipes the whole output dir, including any leftover .isr-cache/
-			// from a previous build — so every deploy starts with a clean ISR
-			// cache instead of possibly serving stale HTML from the last build.
 			builder.rimraf(dest);
 			builder.rimraf(tmp);
 			mkdirSync(tmp, { recursive: true });
@@ -122,44 +129,24 @@ export default function (options: AdapterOptions = {}): Adapter {
 			builder.writeServer(tmp);
 
 			// 4. Generate route manifest
-			const prerenderedPaths = JSON.stringify(builder.prerendered.paths);
+			const isrRoutes: Record<string, { revalidate: number | null }> = {};
 
-			// Resolve ISR `revalidate` per prerendered path at build time. `builder.routes`
-			// already gives us `config` fully merged across the layout chain (same merge
-			// SvelteKit uses internally for adapter.supports.read), so no need to walk
-			// node modules ourselves at runtime — just match each concrete prerendered
-			// path against its route pattern and pull `config.revalidate` off it.
-			const isrRevalidate: Record<string, number> = {};
-			for (const path of builder.prerendered.paths) {
-				const route = builder.routes.find((r) => r.pattern.test(path));
-				const revalidate = (route?.config as Config | undefined)?.revalidate;
-				if (typeof revalidate !== "number" || revalidate <= 0) continue;
+			for (const route of builder.routes) {
+				if (route.prerender !== "auto") continue;
 
-				// `prerender = true` strips the route from the SSR manifest entirely (SvelteKit
-				// does this to shrink the server bundle), which means our runtime regenerate()
-				// call — which goes through server.respond() — has nothing to match and always
-				// 404s. `'auto'` keeps the static output *and* keeps the route in the manifest,
-				// which is exactly what ISR needs.
-				if (route?.prerender !== "auto") {
-					builder.log.warn(
-						`[${ADAPTER_NAME}] ${path} sets config.revalidate but "export const prerender" ` +
-							`is not 'auto'. Routes with prerender = true are stripped from the SSR ` +
-							`manifest, so the adapter can't re-render them at runtime — ISR will be a ` +
-							`no-op here. Change to \`export const prerender = 'auto'\` to enable it.`,
-					);
-					continue;
-				}
+				const revalidate = (route.config as Config | undefined)?.revalidate;
+				const normalizedRevalidate =
+					typeof revalidate === "number" && revalidate > 0 ? revalidate : null;
 
-				isrRevalidate[path] = revalidate;
+				isrRoutes[route.id] = { revalidate: normalizedRevalidate };
 			}
 
 			writeFileSync(
 				join(tmp, "manifest.js"),
 				[
 					`export const manifest = ${builder.generateManifest({ relativePath: "./" })};`,
-					`export const prerendered = new Set(${prerenderedPaths});`,
 					`export const base = ${JSON.stringify(builder.config.kit.paths.base)};`,
-					`export const isrRevalidate = ${JSON.stringify(isrRevalidate)};`,
+					`export const isrRoutes = ${JSON.stringify(isrRoutes)};`,
 				].join("\n\n"),
 			);
 
@@ -207,9 +194,7 @@ export default function (options: AdapterOptions = {}): Adapter {
 				await copyDirAsync(viteManifest, join(serverDest, ".vite"));
 			}
 
-			// 5b. Bundle hooks.server's `websocket` export (if any) so the runtime
-			// server can wire it into Bun.serve without us having to reach into
-			// SvelteKit's internal server bundle, which doesn't expose it.
+			// 5b. Bundle hooks.server's websocket export if present
 			let hasWebsocketExport = false;
 			if (websockets) {
 				const hooksSrc = ["src/hooks.server.ts", "src/hooks.server.js"]
@@ -226,13 +211,6 @@ export default function (options: AdapterOptions = {}): Adapter {
 							naming: "hooks.js",
 							target: "bun",
 							format: "esm",
-							// $env/* and $app/* are Vite-only virtual modules — no physical
-							// file exists for Bun to resolve, so they stay external.
-							// $lib/* is real project code (src/lib) resolved via
-							// tsconfig.json "paths" — do NOT externalize it, or any
-							// hooks.server.ts that imports from $lib (db clients,
-							// session stores, etc.) will emit an unresolved import
-							// and crash at runtime instead of build time.
 							external: ["$env/*", "$app/*"],
 						});
 						if (result.success) {
@@ -247,11 +225,7 @@ export default function (options: AdapterOptions = {}): Adapter {
 				}
 			}
 
-			// 6. Write the Bun server entry point with ISR caching.
-			// When clustering is on, the real server lands at `app.js` and
-			// `index.js` becomes the supervisor that spawns N copies of it.
-			// When clustering is off, the server itself is `index.js`, same
-			// as before this option existed.
+			// 6. Write Bun server entry point
 			const serverFileName = cluster ? "app.js" : "index.js";
 			writeFileSync(
 				join(dest, serverFileName),
@@ -293,7 +267,6 @@ async function copyDirAsync(src: string, dest: string) {
 	}
 }
 
-// Extensions that are already compressed / not worth (re)compressing.
 const SKIP_COMPRESS_EXT = new Set([
 	".gz",
 	".br",
@@ -341,7 +314,6 @@ async function precompressDir(dir: string) {
 			});
 			writeFileSync(`${fullPath}.br`, br);
 
-			// zstd: only available on newer Bun builds. Best-effort.
 			const zstdCompress = (
 				Bun as unknown as { zstdCompressSync?: (b: Buffer) => Buffer }
 			).zstdCompressSync;
@@ -350,7 +322,7 @@ async function precompressDir(dir: string) {
 					const zst = zstdCompress(data);
 					writeFileSync(`${fullPath}.zst`, zst);
 				} catch {
-					// ignore — zstd precompression is best-effort
+					// ignore
 				}
 			}
 		}
@@ -369,13 +341,13 @@ function generateServerCode(opts: {
 
 	return `
 import { Server } from './server/index.js';
-import { manifest, prerendered, base, isrRevalidate } from './server/manifest.js';
+import { manifest, base, isrRoutes } from './server/manifest.js';
 ${hasWebsocketExport ? "import { websocket } from './server/hooks.js';" : ""}
-import { Glob } from 'bun';
 import { join } from 'node:path';
 import { stat, unlink } from 'node:fs/promises';
 
 const ADAPTER_NAME = 'svelte-adapter-bun-isr';
+const REGISTRY_KEY = ${JSON.stringify(`${ADAPTER_NAME}/registry`)};
 const ENV_PREFIX = ${JSON.stringify(envPrefix)};
 const DEFAULT_IDLE_TIMEOUT = ${idleTimeout};
 const SERVE_ASSETS = ${JSON.stringify(serveAssets)};
@@ -387,7 +359,6 @@ function env(name, fallback) {
   return value === undefined ? fallback : value;
 }
 
-// --- Runtime binding config ---------------------------------------------
 const HOST = env('HOST', '0.0.0.0');
 const PORT = Number(env('PORT', 3000));
 const SOCKET_PATH = env('SOCKET_PATH', undefined);
@@ -403,37 +374,6 @@ await server.init({
   read: (file) => Bun.file(join(ASSET_DIR, file)).stream(),
 });
 
-// Pre-compute: O(1) lookup set for static client assets
-const clientAssets = new Set();
-if (SERVE_ASSETS) {
-  const assetGlob = new Glob('**/*');
-  for await (const entry of assetGlob.scan({ cwd: ASSET_DIR, onlyFiles: true, absolute: false })) {
-    if (entry.endsWith('.gz') || entry.endsWith('.br') || entry.endsWith('.zst')) continue;
-    clientAssets.add('/' + base + '/' + entry);
-  }
-}
-
-// Pre-open BunFile handles for every prerendered path (zero-syscall serving)
-const prerenderedFiles = new Map();
-if (SERVE_ASSETS) {
-  for (const p of prerendered) {
-    const candidates = [
-      join(PRERENDERED_DIR, p),
-      join(PRERENDERED_DIR, p + '.html'),
-      join(PRERENDERED_DIR, p, 'index.html'),
-    ];
-    for (const filePath of candidates) {
-      const f = Bun.file(filePath);
-      if (await f.exists()) {
-        // CHANGE: Store the raw string path, NOT the 'f' object
-        prerenderedFiles.set(p, filePath);
-        break;
-      }
-    }
-  }
-}
-// Negotiate best precompressed variant for a file path + Accept-Encoding header.
-// Returns { file, encoding } or null if nothing precompressed is available/accepted.
 async function negotiateCompressed(filePath, acceptEncoding) {
   if (!acceptEncoding) return null;
   const accepts = acceptEncoding.toLowerCase();
@@ -450,37 +390,33 @@ async function negotiateCompressed(filePath, acceptEncoding) {
   return null;
 }
 
-// --- Stale-while-revalidate ISR -----------------------------------------
-// No background interval workers. Freshness is only checked when a request
-// actually hits an ISR-configured path:
-//   - fresh  (age <= revalidate) -> serve cached HTML, do nothing else
-//   - stale  (age >  revalidate) -> serve cached/build-time HTML immediately,
-//                                    fire a background regeneration (unawaited)
-//                                    so the NEXT request gets fresh content
-//
-// The regenerated cache is persisted to disk under ISR_CACHE_DIR (inside the
-// build output, alongside client/ and prerendered/), NOT held in an in-memory
-// Map. That matters because with \`cluster: true\` there isn't one server
-// process, there are N — each is a separate OS process with its own memory,
-// so an in-memory cache is invisible to every worker except the one that
-// happened to regenerate it. Every other worker (and the kernel round-robins
-// requests across all of them via SO_REUSEPORT) would see a permanent cache
-// miss and hammer server.respond() on every single request instead of only
-// once per revalidate window. Writing to disk means whichever worker
-// regenerates first, every worker (this one on restart, and every sibling
-// worker on its next request) reads the same fresh file.
-//
-// isrInFlight below is still an in-memory Set, and that's fine — it's only a
-// per-process de-dupe so one worker doesn't fire five concurrent
-// regenerations for five concurrent requests to the same stale path. Two
-// different worker processes can still both regenerate the same path around
-// the same time; that's a harmless duplicate write (last one wins), not a
-// correctness problem, so it isn't worth a cross-process lock.
-const isrInFlight = new Set(); // paths currently being regenerated *in this process*
-const serverStartedAt = Date.now();
+function findRouteForPath(path) {
+  return manifest._.routes.find((r) => r.pattern.test(path));
+}
+
+// Zero-memory cluster-safe file resolver
+async function getPrerenderedFilePath(path) {
+  const normalized = path === '/' || path === '' ? '/index' : path;
+  const candidates = [
+    join(PRERENDERED_DIR, normalized + '.html'),
+    join(PRERENDERED_DIR, path, 'index.html'),
+    join(PRERENDERED_DIR, path),
+  ];
+  for (const candidate of candidates) {
+    if (await Bun.file(candidate).exists()) return candidate;
+  }
+  return null;
+}
+
+function getPrerenderedDiskPath(path) {
+  if (path === '/' || path === '') return join(PRERENDERED_DIR, 'index.html');
+  return join(PRERENDERED_DIR, path + '.html');
+}
+
+const isrInFlight = new Set();
 
 async function regenerateIsr(path) {
-  if (isrInFlight.has(path)) return;
+  if (isrInFlight.has(path)) return false;
   isrInFlight.add(path);
   try {
     const request = new Request('http://isr-worker' + path);
@@ -488,39 +424,148 @@ async function regenerateIsr(path) {
       getClientAddress: () => '127.0.0.1',
     });
     if (response.status === 200) {
-      const filePath = prerenderedFiles.get(path);
+      const existingPath = await getPrerenderedFilePath(path);
+      const filePath = existingPath || getPrerenderedDiskPath(path);
 
-      if (filePath) {
-        // Write directly to the string path
-        await Bun.write(filePath, await response.arrayBuffer());
+      await Bun.write(filePath, await response.arrayBuffer());
 
-        const exts = ['.br', '.gz', '.zst'];
-        for (const ext of exts) {
-          const compFile = Bun.file(filePath + ext);
-          if (await compFile.exists()) {
-            await unlink(filePath + ext).catch(() => {});
-          }
-        }
+      for (const ext of ['.br', '.gz', '.zst']) {
+        await unlink(filePath + ext).catch(() => {});
       }
-    } else {
-      console.warn(\`[\${ADAPTER_NAME}] ISR regenerate \${path} -> \${response.status}, keeping stale content\`);
+      return true;
     }
+    console.warn(\`[\${ADAPTER_NAME}] regenerate \${path} -> \${response.status}, keeping existing content\`);
+    return false;
   } catch (err) {
-    console.error(\`[\${ADAPTER_NAME}] ISR regenerate failed for \${path}\`, err);
+    console.error(\`[\${ADAPTER_NAME}] regenerate failed for \${path}\`, err);
+    return false;
   } finally {
     isrInFlight.delete(path);
   }
 }
 
-// Under the cluster supervisor every worker imports this same module, so
-// without a guard this log fires once per worker. WORKER_INDEX is only set
-// by the supervisor (see generateSupervisorCode) — worker 0 prints it,
-// everyone else stays quiet. Unset (cluster: false, single process) also
-// prints, since there's only one process to begin with.
+async function regenerateImpl(paths, removePaths) {
+  const result = { regenerated: [], created: [], removed: [], failed: [] };
+
+  for (const entry of paths) {
+    if (entry.includes('[')) {
+      const routeCfg = isrRoutes[entry];
+      if (!routeCfg) {
+        result.failed.push({ path: entry, reason: 'not an ISR-enabled route (prerender must be auto)' });
+        continue;
+      }
+      const route = manifest._.routes.find((r) => r.id === entry);
+      if (!route) {
+        result.failed.push({ path: entry, reason: 'route not found in runtime manifest' });
+        continue;
+      }
+
+      const nodeIndex = route.page && typeof route.page.leaf === 'number' ? route.page.leaf : undefined;
+      if (nodeIndex === undefined) {
+        result.failed.push({ path: entry, reason: 'no +page node with entries for this route id' });
+        continue;
+      }
+
+      try {
+        const node = await manifest._.nodes[nodeIndex]();
+        const entriesFn = node?.server?.entries ?? node?.universal?.entries;
+
+        let paramSets = [];
+        if (typeof entriesFn === 'function') {
+          paramSets = (await entriesFn()) || [];
+        }
+
+        if (!paramSets || paramSets.length === 0) {
+          continue;
+        }
+
+        for (const params of paramSets) {
+          const concretePath = entry.replace(/\\[(\\.\\.\\.)?([^\\]]+)\\]/g, (_m, _rest, name) => {
+            const value = params[name];
+            return value === undefined ? '' : String(value);
+          });
+          const existingPath = await getPrerenderedFilePath(concretePath);
+          const ok = await regenerateIsr(concretePath);
+          if (ok) {
+            result[existingPath ? 'regenerated' : 'created'].push(concretePath);
+          } else {
+            result.failed.push({ path: concretePath, reason: 'render failed' });
+          }
+        }
+      } catch (err) {
+        result.failed.push({ path: entry, reason: 'entries/regeneration threw: ' + String(err) });
+      }
+      continue;
+    }
+
+    const route = findRouteForPath(entry);
+    if (route && !isrRoutes[route.id]) {
+      result.failed.push({ path: entry, reason: 'route is not ISR-enabled (prerender must be auto)' });
+      continue;
+    }
+
+    const existingPath = await getPrerenderedFilePath(entry);
+    const ok = await regenerateIsr(entry);
+    if (ok) {
+      result[existingPath ? 'regenerated' : 'created'].push(entry);
+    } else {
+      result.failed.push({ path: entry, reason: 'render failed' });
+    }
+  }
+
+  for (const path of removePaths) {
+    const filePath = await getPrerenderedFilePath(path);
+    if (!filePath) {
+      result.failed.push({ path, reason: 'not a tracked prerendered path' });
+      continue;
+    }
+    try {
+      await unlink(filePath).catch(() => {});
+      for (const ext of ['.br', '.gz', '.zst']) {
+        await unlink(filePath + ext).catch(() => {});
+      }
+      result.removed.push(path);
+    } catch (err) {
+      result.failed.push({ path, reason: String(err) });
+    }
+  }
+
+  return result;
+}
+
+globalThis[REGISTRY_KEY] = { regenerate: regenerateImpl };
+
 const workerIndex = env('WORKER_INDEX', undefined);
-const isrPathCount = Object.keys(isrRevalidate).length;
-if (isrPathCount > 0 && (workerIndex === undefined || workerIndex === '0')) {
-  console.log(\`[\${ADAPTER_NAME}] ISR enabled for \${isrPathCount} route(s), writing directly to \${PRERENDERED_DIR}\`);
+const isrRouteCount = Object.keys(isrRoutes).length;
+if (isrRouteCount > 0 && (workerIndex === undefined || workerIndex === '0')) {
+  console.log(\`[\${ADAPTER_NAME}] ISR enabled for \${isrRouteCount} route pattern(s), serving from \${PRERENDERED_DIR}\`);
+}
+
+async function get404Response() {
+  const fallback404Path = join(PRERENDERED_DIR, '404.html');
+  const fallbackFile = Bun.file(fallback404Path);
+
+  if (await fallbackFile.exists()) {
+    return new Response(fallbackFile, {
+      status: 404,
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+  }
+
+  try {
+    const res = await server.respond(new Request('http://isr-worker/__404__'), {
+      getClientAddress: () => '127.0.0.1',
+    });
+    const html = await res.arrayBuffer();
+    await Bun.write(fallback404Path, html);
+
+    return new Response(html, {
+      status: 404,
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+  } catch {
+    return new Response('Not Found', { status: 404 });
+  }
 }
 
 const bunServer = Bun.serve({
@@ -535,50 +580,51 @@ const bunServer = Bun.serve({
     const pathname = url.pathname;
     const acceptEncoding = request.headers.get('accept-encoding');
 
-    // 1. Static client assets
-    if (SERVE_ASSETS && clientAssets.has(pathname)) {
-      const filePath = join(ASSET_DIR, pathname.slice(base.length + 1) || pathname);
-      const headers = {};
-      if (pathname.includes('/immutable/')) {
-        headers['cache-control'] = 'public,max-age=31536000,immutable';
-      }
-      headers['vary'] = 'Accept-Encoding';
+    // 1. Static Client Assets (_app/*, static directory files)
+    if (SERVE_ASSETS) {
+      const relativePath = pathname.startsWith(base) ? pathname.slice(base.length) : pathname;
+      if (relativePath !== '/' && relativePath !== '') {
+        const assetPath = join(ASSET_DIR, relativePath);
+        const assetFile = Bun.file(assetPath);
+        if (await assetFile.exists()) {
+          const headers = { vary: 'Accept-Encoding' };
+          if (relativePath.startsWith('/_app/immutable/')) {
+            headers['cache-control'] = 'public,max-age=31536000,immutable';
+          }
 
-      const compressed = await negotiateCompressed(filePath, acceptEncoding);
-      if (compressed) {
-        headers['content-encoding'] = compressed.encoding;
-        return new Response(compressed.file, { headers });
+          const compressed = await negotiateCompressed(assetPath, acceptEncoding);
+          if (compressed) {
+            headers['content-encoding'] = compressed.encoding;
+            return new Response(compressed.file, { headers });
+          }
+          return new Response(assetFile, { headers });
+        }
       }
-      return new Response(Bun.file(filePath), { headers });
     }
 
-    // 2. Prerendered pages, with stale-while-revalidate for ISR-configured routes
+    // 2. Prerendered ISR Pages
     if (SERVE_ASSETS) {
-      // This is now a string path!
-      const filePath = prerenderedFiles.get(pathname);
+      const filePath = await getPrerenderedFilePath(pathname);
 
       if (filePath) {
-        const revalidateSec = isrRevalidate[pathname];
+        const route = findRouteForPath(pathname);
+        const revalidateSec = route ? isrRoutes[route.id]?.revalidate : null;
 
-        if (revalidateSec !== undefined) {
+        if (revalidateSec !== undefined && revalidateSec !== null) {
           try {
             const fileStat = await stat(filePath);
             const age = Date.now() - fileStat.mtimeMs;
-            const isStale = age > revalidateSec * 1000;
-
-            if (isStale) {
+            if (age > revalidateSec * 1000) {
               regenerateIsr(pathname);
             }
-          } catch (e) {
+          } catch {
             regenerateIsr(pathname);
           }
         }
 
-        // Dynamically create a new BunFile instance so the file size is always 100% accurate!
         const freshFile = Bun.file(filePath);
-
         const headers = {
-          'Content-Type': freshFile.type || 'text/html',
+          'content-type': freshFile.type || 'text/html; charset=utf-8',
           vary: 'Accept-Encoding'
         };
 
@@ -592,7 +638,13 @@ const bunServer = Bun.serve({
       }
     }
 
-    // 3. Everything else: normal dynamic SSR, no caching
+    // 3. Block dynamic SSR for unknown paths on ISR routes
+    const route = findRouteForPath(pathname);
+    if (route && isrRoutes[route.id]) {
+      return get404Response();
+    }
+
+    // 4. Everything else: normal dynamic SSR
     return server.respond(request, {
       platform: { server: bunServer, request },
       getClientAddress: () => request.headers.get('x-forwarded-for') ?? '127.0.0.1',
@@ -618,10 +670,6 @@ function generateSupervisorCode(opts: { envPrefix: string }): string {
 	const { envPrefix } = opts;
 
 	return `
-// Cluster supervisor: spawns N copies of ./app.js, each binding the same
-// PORT/SOCKET_PATH with reusePort (SO_REUSEPORT), so the kernel load-balances
-// connections across processes/cores. app.js has no idea it's being clustered —
-// it just binds like normal.
 import { spawn } from 'bun';
 import { cpus as osCpus } from 'node:os';
 import { join } from 'node:path';
@@ -634,10 +682,6 @@ function env(name, fallback) {
   return value === undefined ? fallback : value;
 }
 
-// Worker count: \${envPrefix}CPUS env wins if set (0 or negative is invalid
-// and falls back). Otherwise navigator.hardwareConcurrency, then node:os as
-// a second fallback, then 1 — resolved at runtime so a build done on a
-// 4-core CI box still scales correctly on an 8-core prod host.
 const cpusRaw = env('CPUS', undefined);
 const cpusFromEnv = cpusRaw === undefined ? undefined : Number(cpusRaw);
 const CPUS =
@@ -647,10 +691,6 @@ const CPUS =
       osCpus().length ||
       1;
 
-// Bun binary: \${envPrefix}BUN_BINARY env wins if set (absolute path or a
-// name resolved via PATH). Otherwise process.execPath — the exact binary
-// this supervisor is currently running under, which is the most reliable
-// "auto discovery" available (no guessing at PATH resolution order).
 const BUN_BINARY = env('BUN_BINARY', undefined) || process.execPath || 'bun';
 
 const APP_ENTRY = join(import.meta.dir, 'app.js');
@@ -671,9 +711,6 @@ function spawnWorker(i) {
 
   workers[i] = proc;
 
-  // Bun.Subprocess has no 'exit' event — .exited is a Promise. Respawn on
-  // unexpected death so one crashed worker doesn't quietly shrink your
-  // effective concurrency; skipped entirely once shutdown() has fired.
   proc.exited.then((code) => {
     if (shuttingDown) return;
     console.warn(
