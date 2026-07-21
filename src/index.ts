@@ -369,6 +369,11 @@ const IDLE_TIMEOUT =
 
 const server = new Server(manifest);
 
+// Precompute route order once: static > matched params > plain params
+// > rest params. Lookups then stay a simple linear find with no
+// per-request sorting or recursion.
+const sortedRoutes = [...manifest._.routes].sort(compareRouteSpecificity);
+
 await server.init({
   env: Bun.env,
   read: (file) => Bun.file(join(ASSET_DIR, file)).stream(),
@@ -390,10 +395,31 @@ async function negotiateCompressed(filePath, acceptEncoding) {
   return null;
 }
 
-function findRouteForPath(path) {
-  return manifest._.routes.find((r) => r.pattern.test(path));
+// Lower weight = more specific. Static segments always win over
+// dynamic ones; matched params ([x=matcher]) beat plain params ([x]);
+// rest params ([...x]) are least specific.
+function segmentWeight(seg) {
+  if (seg.startsWith('[...')) return 3;
+  if (seg.startsWith('[') && seg.includes('=')) return 1;
+  if (seg.startsWith('[')) return 2;
+  return 0; // static
 }
 
+function compareRouteSpecificity(a, b) {
+  const as = a.id.split('/');
+  const bs = b.id.split('/');
+  const len = Math.min(as.length, bs.length);
+  for (let i = 0; i < len; i++) {
+    const wa = segmentWeight(as[i]);
+    const wb = segmentWeight(bs[i]);
+    if (wa !== wb) return wa - wb;
+  }
+  return as.length - bs.length;
+}
+
+function findRouteForPath(path) {
+  return sortedRoutes.find((r) => r.pattern.test(path));
+}
 // Zero-memory cluster-safe file resolver
 async function getPrerenderedFilePath(path) {
   const normalized = path === '/' || path === '' ? '/index' : path;
@@ -502,7 +528,7 @@ async function regenerateImpl(paths, removePaths) {
     }
 
     const route = findRouteForPath(entry);
-    if (route && !isrRoutes[route.id]) {
+    if (!route || !isrRoutes[route.id]) {
       result.failed.push({ path: entry, reason: 'route is not ISR-enabled (prerender must be auto)' });
       continue;
     }

@@ -308,6 +308,57 @@ Notes:
 - stale build-time content still works as fallback
 - under `cluster: true`, each worker process keeps its own independent ISR cache — this is harmless (worst case is duplicated regeneration work across workers) but worth knowing if you need revalidation timing to line up exactly across cores
 
+## Manual regeneration
+
+Beyond time-based `revalidate`, you can trigger regeneration on demand from inside a running request (e.g. a webhook handler) by importing `regenerate` from the adapter package:
+
+```ts
+// src/routes/api/regenerate/+server.ts
+import { json } from '@sveltejs/kit';
+import { regenerate } from '@pingpolls/svelte-adapter-bun-isr';
+import type { RequestHandler } from './$types';
+
+export const POST: RequestHandler = async ({ request }) => {
+	const { paths = [], removePaths = [] } = await request.json();
+	const result = await regenerate(paths, removePaths);
+	return json(result);
+};
+```
+
+```ts
+import { regenerate, type RegenerateResult } from '@pingpolls/svelte-adapter-bun-isr';
+
+const result: RegenerateResult = await regenerate(
+	['/isr/page', '/isr/server.json'], // paths (or route ids, see below) to re-render
+	['/isr/stale-item'],                // paths to delete from the prerendered cache
+);
+```
+
+`regenerate()` only works while `build/app.js` (or `build/index.js` with `cluster: false`) is actually running, and only when called from inside a request — it looks up a runtime registry that's populated by the generated server, so calling it outside a live server throws.
+
+`RegenerateResult` shape:
+
+```ts
+interface RegenerateResult {
+	regenerated: string[];                          // existing prerendered paths re-rendered in place
+	created: string[];                               // brand-new paths written for the first time
+	removed: string[];                                // paths deleted (from removePaths)
+	failed: { path: string; reason: string }[];       // anything that didn't work, with why
+}
+```
+
+### Dynamic ISR routes (`[slug]`, `[id]`, etc.)
+
+For a prerendered dynamic route (e.g. `src/routes/isr/[slug]/+page.server.ts` with `prerender = 'auto'` and a `+page.server.ts`/`+page.ts` `entries()` export), pass the route's **id** — not a concrete path — to `regenerate()`:
+
+```ts
+await regenerate(['/isr/[slug]']);
+```
+
+The adapter resolves `entries()` for that route's `+page` node at request time, expands every returned param set into a concrete path (e.g. `/isr/hello-world`), and regenerates each one individually. Each concrete path is reported separately in `regenerated`/`created`/`failed`. If the route's node has no `entries()` (or it returns nothing), the call is a no-op for that id — it does not error.
+
+Concrete paths (e.g. `/isr/todo/42`) can still be passed directly instead of the route id — that regenerates just the one path without invoking `entries()`.
+
 ## Precompression behavior
 
 When `precompress` is enabled, the adapter scans:
@@ -375,6 +426,7 @@ build/
 - precompressed variants are best effort for `zst`
 - if `serveAssets` is disabled, static asset serving is expected elsewhere
 - `cluster: true` and an external process manager both managing worker count will multiply concurrency — use one or the other
+- manual `regenerate()` for a dynamic route id (e.g. `/isr/[slug]`) depends on that route's `+page` node exporting `entries()` — without it, the call silently no-ops for that id
 
 ## Development notes
 

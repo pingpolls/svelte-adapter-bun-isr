@@ -1,10 +1,8 @@
 import { error } from "@sveltejs/kit";
 import { getTodoFromSlug, getTodos } from "$lib/server/db";
-import type { Config } from "../../../../../src";
 import type { EntryGenerator, PageServerLoad } from "./$types";
 
 export const prerender = "auto";
-export const config: Config = { revalidate: 8 };
 
 export const entries: EntryGenerator = () => {
 	const todos = getTodos();

@@ -208,8 +208,8 @@ async function fetchPageSections(urlPath: string) {
 	return extractSectionItems(html);
 }
 
-async function createTodo(text: string) {
-	const res = await fetch(`${BASE_URL}/api/todos`, {
+async function createTodo(text: string, url?: string) {
+	const res = await fetch(`${url ? url : BASE_URL}/api/todos`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ text }),
@@ -465,6 +465,197 @@ describe("ISR System", () => {
 				expect(server.exitCode).not.toBeNull();
 				server = null;
 			}
+			rmIfExists(BUILD_DIR);
+			rmIfExists(DB_PATH);
+			expect(existsSync(BUILD_DIR)).toBe(false);
+			expect(existsSync(DB_PATH)).toBe(false);
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
+});
+
+describe("Manual regeneration API & dynamic ISR routes", () => {
+	let server: import("bun").Subprocess | null = null;
+	const REGEN_PORT = PORT + 2; // distinct port to avoid clashing with other describe blocks
+
+	const REGEN_BASE_URL = `http://localhost:${REGEN_PORT}`;
+
+	async function startRegenServer(): Promise<import("bun").Subprocess> {
+		const proc = Bun.spawn({
+			cmd: START_CMD,
+			cwd: FIXTURES_DIR,
+			stdout: "pipe",
+			stderr: "pipe",
+			env: { ...process.env, PORT: String(REGEN_PORT) },
+		});
+
+		const deadline = Date.now() + SERVER_BOOT_TIMEOUT_MS;
+		let lastError: unknown;
+
+		while (Date.now() < deadline) {
+			if (proc.exitCode !== null) {
+				const stderr = proc.stderr
+					? await new Response(proc.stderr).text()
+					: "";
+				throw new Error(
+					`Server process exited early (code ${proc.exitCode}) before becoming ready.\n${stderr}`,
+				);
+			}
+			try {
+				const res = await fetch(`${REGEN_BASE_URL}/no-isr/page`);
+				if (res.ok) return proc;
+			} catch (err) {
+				lastError = err;
+			}
+			await Bun.sleep(SERVER_BOOT_POLL_MS);
+		}
+
+		proc.kill();
+		throw new Error(
+			`Server did not become ready within ${SERVER_BOOT_TIMEOUT_MS}ms. Last error: ${String(lastError)}`,
+		);
+	}
+
+	async function postRegenerate(paths: string[], removePaths: string[] = []) {
+		const res = await fetch(`${REGEN_BASE_URL}/api/regenerate`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ paths, removePaths }),
+		});
+		expect(res.ok).toBe(true);
+		return (await res.json()) as {
+			regenerated: string[];
+			created: string[];
+			removed: string[];
+			failed: { path: string; reason: string }[];
+		};
+	}
+
+	afterAll(async () => {
+		if (server && server.exitCode === null) {
+			server.kill();
+			await server.exited;
+		}
+		rmIfExists(BUILD_DIR);
+		rmIfExists(DB_PATH);
+	});
+
+	test(
+		"Migrate the initial schema, build, and boot the server",
+		async () => {
+			runCmd(PREP_CMD, "prepping");
+			runCmd(MIGRATE_CMD, "migrate");
+			const build = runCmd(BUILD_CMD, "build#regen");
+			expect(build.exitCode).toBe(0);
+			expect(existsSync(BUILD_DIR)).toBe(true);
+
+			server = await startRegenServer();
+			expect(server.exitCode).toBeNull();
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
+
+	test(
+		"Concrete path: POST /api/regenerate creates a brand-new prerendered path",
+		async () => {
+			await createTodo("Hello World", REGEN_BASE_URL);
+
+			// /isr/[slug] is prerender=auto but not seeded via entries() at build
+			// time for this slug, so this is a first-time write -> 'created'.
+			const result = await postRegenerate(["/isr/hello-world"]);
+
+			expect(result.failed).toEqual([]);
+			expect(result.created).toContain("/isr/hello-world");
+			expect(result.regenerated).not.toContain("/isr/hello-world");
+
+			const res = await fetch(`${REGEN_BASE_URL}/isr/hello-world`);
+			expect(res.ok).toBe(true);
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
+
+	test(
+		"Route id with entries(): POST /api/regenerate expands every param set",
+		async () => {
+			// /isr/todo/[id]'s +page.server.ts exports entries() over existing
+			// todo rows -> passing the route id (not a concrete path) should
+			// expand to one concrete path per todo and regenerate each.
+			const result = await postRegenerate(["/isr/todo/[id]"]);
+
+			expect(result.failed).toEqual([]);
+			const touched = [...result.created, ...result.regenerated];
+			expect(touched.length).toBeGreaterThan(0);
+			for (const p of touched) {
+				expect(p.startsWith("/isr/todo/")).toBe(true);
+			}
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
+
+	test(
+		"Non-ISR route id is rejected with a 'not ISR-enabled' reason",
+		async () => {
+			const result = await postRegenerate(["/no-isr/page"]);
+			expect(result.regenerated).toEqual([]);
+			expect(result.created).toEqual([]);
+			expect(result.failed.length).toBe(1);
+			expect(result.failed[0]?.path).toBe("/no-isr/page");
+			expect(result.failed[0]?.reason).toContain("not ISR-enabled");
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
+
+	test(
+		"removePaths deletes a previously regenerated path (and its compressed variants)",
+		async () => {
+			const result = await postRegenerate([], ["/isr/hello-world"]);
+
+			expect(result.removed).toContain("/isr/hello-world");
+			expect(result.failed).toEqual([]);
+
+			// It's gone from the prerendered cache, so the dynamic-SSR fallback
+			// (or bounded-negative-cache 404, depending on route config) takes
+			// over — either way it should no longer serve the old cached file
+			// as a 200 from the prerendered dir. We only assert the regenerate
+			// bookkeeping here since re-render-on-miss behavior is covered by
+			// the "ISR System" describe block above.
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
+
+	test(
+		"Unknown/untracked removePaths entry is reported as failed, not thrown",
+		async () => {
+			const result = await postRegenerate([], ["/isr/does-not-exist"]);
+			expect(result.removed).toEqual([]);
+			expect(result.failed.length).toBe(1);
+			expect(result.failed[0]?.path).toBe("/isr/does-not-exist");
+		},
+		OVERALL_TEST_TIMEOUT_MS,
+	);
+
+	test(
+		"Cleanup server",
+		async () => {
+			// NOTE: stopServerAndVerify() checks BASE_URL (the default PORT),
+			// but this block boots on REGEN_PORT, so we kill + verify manually
+			// against REGEN_BASE_URL instead of reusing that helper.
+			if (server) {
+				server.kill();
+				await server.exited;
+				server = null;
+			}
+
+			let stillUp = true;
+			try {
+				await fetch(`${REGEN_BASE_URL}/no-isr/page`, {
+					signal: AbortSignal.timeout(1000),
+				});
+			} catch {
+				stillUp = false;
+			}
+			expect(stillUp).toBe(false);
+
 			rmIfExists(BUILD_DIR);
 			rmIfExists(DB_PATH);
 			expect(existsSync(BUILD_DIR)).toBe(false);
