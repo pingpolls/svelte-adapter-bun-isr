@@ -1,6 +1,6 @@
 {
 	"name": "@pingpolls/svelte-adapter-bun-isr",
-	"version": "1.0.3",
+	"version": "1.0.4",
 	"description": "SvelteKit adapter for Bun with Incremental Static Regeneration (ISR) support",
 	"license": "MIT",
 	"repository": {
@@ -44,8 +44,7 @@
 		"release": "bun run build && bun test && bunx --bun npm publish --access public"
 	},
 	"peerDependencies": {
-		"@sveltejs/kit": ">=2.0.0",
-		"bun": ">=1.3.14"
+		"@sveltejs/kit": ">=2.0.0"
 	},
 	"devDependencies": {
 		"@sveltejs/kit": "^2.70.1",
