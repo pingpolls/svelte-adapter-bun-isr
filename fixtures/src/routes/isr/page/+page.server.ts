@@ -3,7 +3,7 @@ import type { Config } from "../../../../../src";
 import type { PageServerLoad } from "./$types";
 
 export const prerender = "auto";
-export const config: Config = { revalidate: 3 };
+export const config: Config = { revalidate: 2 };
 
 export const load: PageServerLoad = async () => {
 	console.info("Rerunning page load");

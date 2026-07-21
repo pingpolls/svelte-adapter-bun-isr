@@ -35,7 +35,6 @@ import path from "node:path";
 const FIXTURES_DIR = path.join(process.cwd(), "fixtures");
 const DB_PATH = path.join(FIXTURES_DIR, "db.sqlite");
 const BUILD_DIR = path.join(FIXTURES_DIR, "build");
-const SVELTEKIT_DIR = path.join(FIXTURES_DIR, ".svelte-kit");
 const PORT = Number(process.env.TEST_PORT ?? 3000);
 const BASE_URL = `http://localhost:${PORT}`;
 
@@ -206,7 +205,6 @@ describe("ISR / no-ISR revalidation lifecycle", () => {
 			await server.exited;
 		}
 		rmIfExists(BUILD_DIR);
-		rmIfExists(SVELTEKIT_DIR);
 		rmIfExists(DB_PATH);
 	});
 
@@ -266,9 +264,9 @@ describe("ISR / no-ISR revalidation lifecycle", () => {
 	);
 
 	test(
-		"Wait 3s (isr/page's 3s revalidate window should now have elapsed)",
+		"Wait 2s (isr/page's 2s revalidate window should now have elapsed)",
 		async () => {
-			await Bun.sleep(3 * 1000);
+			await Bun.sleep(2 * 1000);
 
 			for (const p of [
 				"/no-isr/page",
@@ -290,9 +288,9 @@ describe("ISR / no-ISR revalidation lifecycle", () => {
 	);
 
 	test(
-		"Wait 3 more seconds (t=6s: isr/server's 6s window elapses).",
+		"Wait 2 more seconds (t=4s: isr/server's 4s window elapses).",
 		async () => {
-			await Bun.sleep(3 * 1000);
+			await Bun.sleep(2 * 1000);
 
 			for (const p of ["/no-isr/page", "/no-isr/server", "/isr/layout"]) {
 				const count = p.includes("server")
@@ -310,9 +308,9 @@ describe("ISR / no-ISR revalidation lifecycle", () => {
 	);
 
 	test(
-		"Wait 3 more seconds (t=9s: isr layout's 9s window elapses)",
+		"Wait 2 more seconds (t=6s: isr layout's 6s window elapses)",
 		async () => {
-			await Bun.sleep(3 * 1000);
+			await Bun.sleep(2 * 1000);
 
 			for (const p of ["/no-isr/page", "/no-isr/server"]) {
 				const count =
@@ -376,10 +374,8 @@ describe("ISR / no-ISR revalidation lifecycle", () => {
 				server = null;
 			}
 			rmIfExists(BUILD_DIR);
-			rmIfExists(SVELTEKIT_DIR);
 			rmIfExists(DB_PATH);
 			expect(existsSync(BUILD_DIR)).toBe(false);
-			expect(existsSync(SVELTEKIT_DIR)).toBe(false);
 			expect(existsSync(DB_PATH)).toBe(false);
 		},
 		OVERALL_TEST_TIMEOUT_MS,
@@ -411,22 +407,16 @@ describe("New Features: Bun WebSockets, envPrefix, and Custom Build Folders", ()
 	);
 
 	test(
-		"Verify Bun WebSocket handling and envPrefix custom port binding",
+		"Verify Bun WebSocket handling on the adapter's default PORT binding",
 		async () => {
-			// Test envPrefix capability by passing a prefixed PORT variable if configured.
-			// If envPrefix is configured as 'APP_', Bun.serve will read 'APP_PORT'.
-			// We supply both to ensure the server starts regardless of the exact prefix string used in the fixture.
+			// Adapter default is envPrefix: '' (see README usage block), so the
+			// generated server reads plain PORT — no prefix guessing needed.
 			featServer = Bun.spawn({
 				cmd: START_CMD,
 				cwd: FIXTURES_DIR,
 				stdout: "pipe",
 				stderr: "pipe",
-				env: {
-					...process.env,
-					PORT: String(FEAT_PORT),
-					APP_PORT: String(FEAT_PORT),
-					CUSTOM_PORT: String(FEAT_PORT),
-				},
+				env: { ...process.env, PORT: String(FEAT_PORT) },
 			});
 
 			// Poll until the server becomes responsive
@@ -447,8 +437,10 @@ describe("New Features: Bun WebSockets, envPrefix, and Custom Build Folders", ()
 
 			expect(isReady).toBe(true);
 
-			// Initialize a native Bun WebSocket connection to verify the upgraded server bindings
-			const wsUrl = `ws://localhost:${FEAT_PORT}/`;
+			// hooks.server.ts upgrades on /ws (see README example) — hits the
+			// dynamic-SSR fallback path, which is the only branch that gets
+			// `platform.server` / `platform.request` injected.
+			const wsUrl = `ws://localhost:${FEAT_PORT}/ws`;
 			const ws = new WebSocket(wsUrl);
 
 			const wsResponsePromise = new Promise<string>((resolve, reject) => {
@@ -456,14 +448,15 @@ describe("New Features: Bun WebSockets, envPrefix, and Custom Build Folders", ()
 					ws.send("ping");
 				};
 				ws.onmessage = (event) => {
-					resolve(String(event.data));
+					if (event.data !== "connection opened") {
+						resolve(String(event.data));
+					}
 				};
 				ws.onerror = (err) => {
 					reject(err);
 				};
 			});
 
-			// Setup a simple timeout mechanism for the websocket handshake and message response
 			const result = await Promise.race([
 				wsResponsePromise,
 				Bun.sleep(3000).then(() => "timeout"),
@@ -471,30 +464,24 @@ describe("New Features: Bun WebSockets, envPrefix, and Custom Build Folders", ()
 
 			ws.close();
 
-			// Verify that the WebSocket didn't timeout and successfully communicated with Bun.serve
 			expect(result).not.toBe("timeout");
-			// If it's an echo handler, it will return "ping"
+			// Echo handler per the README example
 			expect(result).toBe("ping");
 		},
 		OVERALL_TEST_TIMEOUT_MS,
 	);
 
 	test("Verify build folder output layout integrity and artifacts", () => {
-		// Check both default 'build' or any custom build output directory specified in options
-		const targetBuildDir = BUILD_DIR;
-
-		expect(existsSync(targetBuildDir)).toBe(true);
-		expect(existsSync(path.join(targetBuildDir, "index.js"))).toBe(true);
-		expect(existsSync(path.join(targetBuildDir, "server"))).toBe(true);
-		expect(existsSync(path.join(targetBuildDir, "server", "manifest.js"))).toBe(
+		expect(existsSync(BUILD_DIR)).toBe(true);
+		expect(existsSync(path.join(BUILD_DIR, "index.js"))).toBe(true);
+		expect(existsSync(path.join(BUILD_DIR, "server"))).toBe(true);
+		expect(existsSync(path.join(BUILD_DIR, "server", "manifest.js"))).toBe(
 			true,
 		);
 
-		// If hooks.server.ts bundled successfully with websockets enabled, hooks.js should exist
-		const hooksPath = path.join(targetBuildDir, "server", "hooks.js");
-		if (existsSync(hooksPath)) {
-			expect(existsSync(hooksPath)).toBe(true);
-		}
+		// hooks.js should exist iff hooks.server.ts exports `websocket` and the
+		// adapter's websockets option is enabled (default true).
+		expect(existsSync(path.join(BUILD_DIR, "server", "hooks.js"))).toBe(true);
 	});
 
 	test(
@@ -506,10 +493,8 @@ describe("New Features: Bun WebSockets, envPrefix, and Custom Build Folders", ()
 				featServer = null;
 			}
 			rmIfExists(BUILD_DIR);
-			rmIfExists(SVELTEKIT_DIR);
 			rmIfExists(DB_PATH);
 			expect(existsSync(BUILD_DIR)).toBe(false);
-			expect(existsSync(SVELTEKIT_DIR)).toBe(false);
 			expect(existsSync(DB_PATH)).toBe(false);
 		},
 		OVERALL_TEST_TIMEOUT_MS,

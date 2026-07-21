@@ -165,7 +165,7 @@ export const handle: Handle = async ({ event, resolve }) => {
     request.headers.get('upgrade')?.toLowerCase() === 'websocket';
 
   if (isUpgrade && new URL(request.url).pathname === '/ws') {
-    const upgraded = event.platform!.server.upgrade(event.platform!.request);
+    const upgraded = event.platform?.server?.upgrade(event.platform?.request);
     if (upgraded) return new Response(null, { status: 101 });
   }
 
@@ -189,7 +189,7 @@ export const websocket: Bun.WebSocketHandler<undefined> = {
 import type { RequestHandler } from './$types';
 
 export const GET: RequestHandler = ({ platform }) => {
-  const upgraded = platform!.server.upgrade(platform!.request);
+  const upgraded = platform?.server?.upgrade(platform?.request);
   return upgraded ? new Response(null, { status: 101 }) : new Response('Upgrade failed', { status: 500 });
 };
 ```

@@ -1,5 +1,5 @@
 <script lang="ts">
-    import type { Todo } from "$src/types";
+    import type { Todo } from "$src/app";
 
     type Props = {
         todos: Todo[];
