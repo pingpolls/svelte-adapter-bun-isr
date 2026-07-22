@@ -218,7 +218,7 @@ Load-tested with `wrk` (5m, 4 threads, 512 connections) against `svelte-adapter-
 - Intel i7-13700H (Only 2 CPU utilized for the test)
 - 32 GB of RAM
 
-![Throughput comparison: svelte-adapter-bun vs @pingpolls/svelte-adapter-bun-isr](https://raw.githubusercontent.com/pingpolls/svelte-adapter-bun-isr/refs/heads/main/benchmark/throughput-107.webp)
+![Throughput comparison: svelte-adapter-bun vs @pingpolls/svelte-adapter-bun-isr](https://raw.githubusercontent.com/pingpolls/svelte-adapter-bun-isr/refs/heads/main/benchmark/throughput-v107.webp)
 
 | Mode | svelte-adapter-bun | this adapter | Improvement |
 |---|---|---|---|
