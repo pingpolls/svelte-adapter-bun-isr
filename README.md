@@ -213,19 +213,20 @@ build/
 
 ## Benchmarked performance
 
-Load-tested with `wrk` (15s, 12 threads, 512 connections) against `svelte-adapter-bun` on identical hardware.
+Load-tested with `wrk` (5m, 4 threads, 512 connections) against `svelte-adapter-bun` on:
 
-![Throughput comparison: svelte-adapter-bun vs @pingpolls/svelte-adapter-bun-isr](https://raw.githubusercontent.com/pingpolls/svelte-adapter-bun-isr/refs/heads/main/benchmark/throughput.webp)
+- Intel i7-13700H (Only 2 CPU utilized for the test)
+- 32 GB of RAM
 
-![Latency comparison: svelte-adapter-bun vs @pingpolls/svelte-adapter-bun-isr](https://raw.githubusercontent.com/pingpolls/svelte-adapter-bun-isr/refs/heads/main/benchmark/latency.webp)
+![Throughput comparison: svelte-adapter-bun vs @pingpolls/svelte-adapter-bun-isr](https://raw.githubusercontent.com/pingpolls/svelte-adapter-bun-isr/refs/heads/main/benchmark/throughput-107.webp)
 
 | Mode | svelte-adapter-bun | this adapter | Improvement |
 |---|---|---|---|
-| SSR, no caching | 7,516 req/s · 67.08ms avg | 32,451 req/s · 15.72ms avg | 4.3x throughput, 4.3x lower latency |
-| SSG, prerendered | 64,208 req/s · 7.84ms avg | 300,057 req/s · 1.69ms avg | 4.7x throughput, 4.6x lower latency |
-| ISR, prerendered + revalidation | — | 299,767 req/s · 1.69ms avg | matches static prerender speed |
+| SSR, no caching | 8,975 req/s · 57.04ms avg | 14,587 req/s · 35.10ms avg | 1.6x throughput, 1.6x lower latency |
+| SSG, prerendered | 70,627 req/s · 7.25ms avg | 137,339 req/s · 3.73ms avg | 1.9x throughput, 1.9x lower latency |
+| ISR, prerender = auto | — | 137,362 req/s · 3.73ms avg | matches static prerender speed |
 
-> The SSR gap comes almost entirely from built-in clustering, not raw per-core speed — single-core SSR throughput between the two adapters is comparable. `cluster: true` (default) spawns one worker per CPU core via `reusePort` automatically; pin the count with the `CPUS` env var if needed.
+> The SSR gap comes almost entirely from built-in clustering, not raw per-core speed. Pinned to 1 CPU, this adapter does 8,419 req/s · 60.14ms avg — essentially the same as svelte-adapter-bun's 8,975 req/s on the same single-core setup. The 1.6x SSR gap above only shows up at 2 CPUs, where `cluster: true` (default) spawns one worker per core via Bun's `reusePort` and throughput scales accordingly; pin the count with the `CPUS` env var if needed.
 
 ## Contributing
 
