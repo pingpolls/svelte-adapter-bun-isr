@@ -1,5 +1,4 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, rmSync } from "node:fs";
 import path from "node:path";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────
@@ -21,17 +20,17 @@ const SWR_POLL_DELAY_MS = 100;
 
 // ── GLOBAL SETUP & TEARDOWN ─────────────────────────────────────────────
 
-beforeAll(() => {
-	rmIfExists(BUILD_DIR);
-	rmIfExists(DB_PATH);
+beforeAll(async () => {
+	await rmIfExists(BUILD_DIR);
+	await rmIfExists(DB_PATH);
 	runCmd(PREP_CMD, "prepping");
 	runCmd(MIGRATE_CMD, "migrate");
 	runCmd(BUILD_CMD, "build");
 });
 
-afterAll(() => {
-	rmIfExists(BUILD_DIR);
-	rmIfExists(DB_PATH);
+afterAll(async () => {
+	await rmIfExists(BUILD_DIR);
+	await rmIfExists(DB_PATH);
 });
 
 // ── LOW-LEVEL HELPERS ───────────────────────────────────────────────────
@@ -100,8 +99,10 @@ async function stopAppServer(
 	expect(stillUp).toBe(false);
 }
 
-function rmIfExists(p: string) {
-	if (existsSync(p)) rmSync(p, { recursive: true, force: true });
+async function rmIfExists(p: string) {
+	const file = Bun.file(p);
+	if (await file.exists()) await file.unlink();
+	// if (existsSync(p)) rmSync(p, { recursive: true, force: true });
 }
 
 async function fetchJsonTodos(baseUrl: string, urlPath: string) {
@@ -351,11 +352,15 @@ describe("Websockets and adapter options", () => {
 		expect(result).toBe("ping");
 	});
 
-	test("Build folder output layout integrity and artifacts", () => {
-		expect(existsSync(path.join(BUILD_DIR, "index.js"))).toBe(true);
-		expect(existsSync(path.join(BUILD_DIR, "server", "manifest.js"))).toBe(
+	test("Build folder output layout integrity and artifacts", async () => {
+		expect(await Bun.file(path.join(BUILD_DIR, "index.js")).exists()).toBe(
 			true,
 		);
-		expect(existsSync(path.join(BUILD_DIR, "server", "hooks.js"))).toBe(true);
+		expect(
+			await Bun.file(path.join(BUILD_DIR, "server", "manifest.js")).exists(),
+		).toBe(true);
+		expect(
+			await Bun.file(path.join(BUILD_DIR, "server", "hooks.js")).exists(),
+		).toBe(true);
 	});
 });
