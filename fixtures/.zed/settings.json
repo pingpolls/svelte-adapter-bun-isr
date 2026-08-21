@@ -20,7 +20,7 @@
 	"proxy": "",
 	"agent": {
 		"play_sound_when_agent_done": "always",
-  "tool_permissions": {
+		"tool_permissions": {
 			"tools": {
 				"terminal": {
 					"default": "allow"
@@ -56,7 +56,7 @@
 		"provider": "open_ai_compatible_api",
 		"open_ai_compatible_api": {
 			"max_output_tokens": 150,
-   "prompt_format": "code_gemma",
+			"prompt_format": "code_gemma",
 			"model": "Orbit AI Flash",
 			"api_url": "https://llm.orbitpixels.com/v1/completions"
 		}
@@ -64,28 +64,28 @@
 	"language_models": {
 		"anthropic_compatible": {},
 		"openai_compatible": {
-   "Orbit Pixels": {
-    "api_url": "https://llm.orbitpixels.com/v1",
-    "available_models": [
-     {
-      "name": "Orbit AI",
-      "max_tokens": 98304,
-      "max_output_tokens": 98304,
-      "max_completion_tokens": 98304,
-      "reasoning_effort": "low",
-      "capabilities": {
-       "tools": true,
-       "images": true,
-       "parallel_tool_calls": true,
-       "prompt_cache_key": true,
-       "chat_completions": true,
-       "interleaved_reasoning": false,
-       "max_tokens_parameter": true
-      }
-     }
-    ]
-   }
-  }
+			"Orbit Pixels": {
+				"api_url": "https://llm.orbitpixels.com/v1",
+				"available_models": [
+					{
+						"name": "Orbit AI",
+						"max_tokens": 98304,
+						"max_output_tokens": 98304,
+						"max_completion_tokens": 98304,
+						"reasoning_effort": "low",
+						"capabilities": {
+							"tools": true,
+							"images": true,
+							"parallel_tool_calls": true,
+							"prompt_cache_key": true,
+							"chat_completions": true,
+							"interleaved_reasoning": false,
+							"max_tokens_parameter": true
+						}
+					}
+				]
+			}
+		}
 	},
 	"formatter": "language_server",
 	"format_on_save": "on",
@@ -143,5 +143,5 @@
 			},
 			"language_servers": ["biome", "typescript-language-server", "!vtsls"]
 		}
-	},
+	}
 }

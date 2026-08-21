@@ -1,11 +1,11 @@
 <script lang="ts">
-    import type { Todo } from "$src/app";
+import type { Todo } from "$src/app";
 
-    type Props = {
-        todos: Todo[];
-    };
+type Props = {
+	todos: Todo[];
+};
 
-    let { todos }: Props = $props();
+let { todos }: Props = $props();
 </script>
 
 <section>
