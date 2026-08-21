@@ -1,11 +1,7 @@
-import { cpSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { readdir, readFile } from "node:fs/promises";
+import { cpSync, existsSync, mkdirSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { join } from "node:path";
-import {
-	brotliCompressSync,
-	gzipSync,
-	constants as zlibConstants,
-} from "node:zlib";
+import { brotliCompressSync, constants as zlibConstants } from "node:zlib";
 import type { Adapter, Builder } from "@sveltejs/kit";
 
 /** Options accepted by the adapter factory. */
@@ -138,7 +134,7 @@ export default function (options: AdapterOptions = {}): Adapter {
 				};
 			}
 
-			writeFileSync(
+			Bun.write(
 				join(serverDest, "manifest.js"),
 				[
 					`export const manifest = ${builder.generateManifest({ relativePath: "./" })};`,
@@ -168,7 +164,7 @@ export default function (options: AdapterOptions = {}): Adapter {
 
 			/** 5. Write the Bun entry point(s). */
 			const serverFileName = cluster ? "app.js" : "index.js";
-			writeFileSync(
+			Bun.write(
 				join(dest, serverFileName),
 				generateServerCode({
 					serveAssets,
@@ -178,7 +174,7 @@ export default function (options: AdapterOptions = {}): Adapter {
 				}),
 			);
 			if (cluster) {
-				writeFileSync(
+				Bun.write(
 					join(dest, "index.js"),
 					generateSupervisorCode({ envPrefix }),
 				);
@@ -221,31 +217,28 @@ async function precompressDir(dir: string): Promise<void> {
 			const ext = entry.name.slice(entry.name.lastIndexOf(".")).toLowerCase();
 			if (SKIP_COMPRESS_EXT.has(ext)) return;
 
-			const data = await readFile(fullPath);
-			if (data.byteLength === 0) return;
+			const data = Bun.file(fullPath);
+			if (data.size === 0) return;
 
-			writeFileSync(`${fullPath}.gz`, gzipSync(data, { level: 9 }));
-			writeFileSync(
+			Bun.write(
+				`${fullPath}.gz`,
+				Bun.gzipSync(await data.bytes(), { level: 9 }),
+			);
+			Bun.write(
 				`${fullPath}.br`,
-				brotliCompressSync(data, {
+				brotliCompressSync(await data.bytes(), {
 					params: {
 						[zlibConstants.BROTLI_PARAM_QUALITY]:
 							zlibConstants.BROTLI_MAX_QUALITY,
-						[zlibConstants.BROTLI_PARAM_SIZE_HINT]: data.byteLength,
+						[zlibConstants.BROTLI_PARAM_SIZE_HINT]: data.size,
 					},
 				}),
 			);
 
-			const zstdCompress = (
-				Bun as unknown as { zstdCompressSync?: (b: Buffer) => Buffer }
-			).zstdCompressSync;
-			if (typeof zstdCompress === "function") {
-				try {
-					writeFileSync(`${fullPath}.zst`, zstdCompress(data));
-				} catch {
-					/** zstd unsupported on this platform — skip silently */
-				}
-			}
+			Bun.write(
+				`${fullPath}.zst`,
+				Bun.zstdCompressSync(await data.arrayBuffer()),
+			);
 		}),
 	);
 }
@@ -260,7 +253,7 @@ async function bundleWebsocketHooks(
 		.find(existsSync);
 	if (!hooksSrc) return false;
 
-	const source = await readFile(hooksSrc, "utf-8");
+	const source = await Bun.file(hooksSrc).text();
 	if (!/export\s+(const|function)\s+websocket\b/.test(source)) return false;
 
 	builder.log.minor("Bundling hooks.server websocket export");
