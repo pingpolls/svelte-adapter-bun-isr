@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { utimes } from "node:fs/promises";
 import path from "node:path";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────
@@ -7,10 +8,10 @@ const DB_PATH = path.join(FIXTURES_DIR, "db.sqlite");
 const BUILD_DIR = path.join(FIXTURES_DIR, "build");
 const BASE_PORT = Number(process.env.TEST_PORT ?? 3000);
 
-const PREP_CMD = ["bun", "run", "prepare"];
+const PREP_CMD = ["bun", "run", "--bun", "prepare"];
 const MIGRATE_CMD = ["bun", "src/scripts/prep.ts"];
-const BUILD_CMD = ["bun", "run", "build"];
-const START_CMD = ["bun", "run", "start"];
+const BUILD_CMD = ["bun", "run", "--bun", "build"];
+const START_CMD = ["bun", "run", "--bun", "start"];
 
 const SERVER_BOOT_TIMEOUT_MS = 20_000;
 const SERVER_BOOT_POLL_MS = 250;
@@ -26,7 +27,7 @@ beforeAll(async () => {
 	runCmd(PREP_CMD, "prepping");
 	runCmd(MIGRATE_CMD, "migrate");
 	runCmd(BUILD_CMD, "build");
-});
+}, OVERALL_TEST_TIMEOUT_MS);
 
 afterAll(async () => {
 	await rmIfExists(BUILD_DIR);
@@ -144,6 +145,16 @@ async function createTodo(baseUrl: string, text: string) {
 	expect(res.ok).toBe(true);
 }
 
+async function setPrerenderedAge(urlPath: string, seconds: number) {
+	const filename = urlPath.endsWith(".json") ? urlPath : `${urlPath}.html`;
+	const timestamp = new Date(Date.now() - seconds * 1000);
+	await utimes(
+		path.join(BUILD_DIR, "prerendered", filename),
+		timestamp,
+		timestamp,
+	);
+}
+
 async function assertSwrTransition(
 	fetcher: () => Promise<number>,
 	expectedStaleCount: number,
@@ -169,6 +180,11 @@ describe("ISR System", () => {
 	const baseUrl = `http://localhost:${port}`;
 
 	beforeAll(async () => {
+		// Hold initial snapshots fresh until each test explicitly expires its route.
+		// Build/startup time otherwise consumes the short revalidation windows.
+		for (const urlPath of ["/isr/page", "/isr/server.json", "/isr/layout"]) {
+			await setPrerenderedAge(urlPath, -3600);
+		}
 		server = await startAppServer(port);
 	});
 
@@ -195,7 +211,7 @@ describe("ISR System", () => {
 	test(
 		"ISR Page revalidates after 2s window",
 		async () => {
-			await Bun.sleep(2000);
+			await setPrerenderedAge("/isr/page", 2.1);
 
 			// Unchanged routes
 			expect((await fetchPageSections(baseUrl, "/no-isr/page")).length).toBe(0);
@@ -212,6 +228,9 @@ describe("ISR System", () => {
 				0,
 				1,
 			);
+			const dataResponse = await fetch(`${baseUrl}/isr/page/__data.json`);
+			expect(dataResponse.status).toBe(200);
+			expect(await dataResponse.text()).toContain("wash the dishes");
 		},
 		OVERALL_TEST_TIMEOUT_MS,
 	);
@@ -219,7 +238,7 @@ describe("ISR System", () => {
 	test(
 		"ISR Server JSON revalidates after 4s window",
 		async () => {
-			await Bun.sleep(2000);
+			await setPrerenderedAge("/isr/server.json", 4.1);
 
 			// Previously updated route
 			expect((await fetchPageSections(baseUrl, "/isr/page")).length).toBe(1);
@@ -237,7 +256,7 @@ describe("ISR System", () => {
 	test(
 		"ISR Layout revalidates after 6s window",
 		async () => {
-			await Bun.sleep(2000);
+			await setPrerenderedAge("/isr/layout", 6.1);
 
 			// ISR layout transition
 			await assertSwrTransition(
@@ -301,6 +320,9 @@ describe("Manual regeneration API & dynamic ISR routes", () => {
 		expect(result.failed).toEqual([]);
 		expect(result.created).toContain("/isr/hello-world");
 		expect((await fetch(`${baseUrl}/isr/hello-world`)).ok).toBe(true);
+		const dataResponse = await fetch(`${baseUrl}/isr/hello-world/__data.json`);
+		expect(dataResponse.status).toBe(200);
+		expect(await dataResponse.text()).toContain("Hello World");
 	});
 
 	test("Route id with entries() expands every param set", async () => {
@@ -320,6 +342,16 @@ describe("Manual regeneration API & dynamic ISR routes", () => {
 	test("removePaths successfully deletes paths", async () => {
 		const result = await postRegenerate([], ["/isr/hello-world"]);
 		expect(result.removed).toContain("/isr/hello-world");
+		expect(
+			await Bun.file(
+				path.join(BUILD_DIR, "prerendered/isr/hello-world.html"),
+			).exists(),
+		).toBe(false);
+		expect(
+			await Bun.file(
+				path.join(BUILD_DIR, "prerendered/isr/hello-world/__data.json"),
+			).exists(),
+		).toBe(false);
 	});
 });
 

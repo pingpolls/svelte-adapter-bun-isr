@@ -45,10 +45,25 @@ bun run build/index.js
 | `out` | `'build'` | Output directory |
 | `serveAssets` | `true` | Serve client assets + prerendered pages from Bun. Set `false` if a CDN/proxy does this instead |
 | `precompress` | `true` | Emit `.gz`/`.br`/`.zst` variants at build time, negotiated via `Accept-Encoding` |
-| `envPrefix` | `''` | Prefix for runtime env vars (`HOST`, `PORT`, `SOCKET_PATH`, `IDLE_TIMEOUT`, `CPUS`, `BUN_BINARY`) |
+| `envPrefix` | `''` | Prefix for runtime env vars (`HOST`, `PORT`, `HOST_HEADER`, `PROTOCOL_HEADER`, `SOCKET_PATH`, `IDLE_TIMEOUT`, `CPUS`, `BUN_BINARY`) |
 | `idleTimeout` | `10` | Default `Bun.serve` idle timeout in seconds (runtime env wins if set) |
 | `websockets` | `true` | Bundle `hooks.server`'s `websocket` export into `Bun.serve` |
 | `cluster` | `true` | Spawn one worker per CPU core behind `SO_REUSEPORT`. Set `false` if something else already manages process count (PM2, k8s HPA, fly.io) — running both multiplies your worker count |
+| `isrHosts` | omitted | Exact, case-insensitive DNS hostname allowlist for **all** prerendered files and unknown-ISR interception. Omitted allows every host (backward compatible); `[]` disables both interceptions. No schemes, ports, wildcards, or paths; request ports are ignored |
+| `isrOrigin` | `'http://isr-worker'` | HTTP(S) origin used by HTML/data regeneration and fallback-404 rendering. An optional trailing `/` is accepted; credentials, other paths, queries, and fragments are rejected at build time |
+
+### Canonical publications with custom-domain SSR
+
+```ts
+adapter({
+  isrHosts: ['pingpolls.com', 'www.pingpolls.com'],
+  isrOrigin: 'https://pingpolls.com',
+});
+```
+
+Only allowlisted hostnames can serve prerendered publications or receive the adapter's unknown-ISR 404. Other hosts go through `server.respond()` so SvelteKit hooks and rerouting can resolve custom-domain forms at the same paths, including `/`. Shared client assets remain available on every host. Only `GET` and `HEAD` are intercepted; actions and other methods always reach SvelteKit. `HEAD` has the same cache status/headers as `GET`, with no body.
+
+Behind a trusted reverse proxy, set `HOST_HEADER=x-forwarded-host` and `PROTOCOL_HEADER=x-forwarded-proto` (with `envPrefix` if configured). The adapter uses these explicitly configured headers for both hostname gating and SvelteKit's request URL. Without configuration, forwarded headers are ignored. Missing headers fall back to the incoming URL; malformed or multi-value configured headers return HTTP 400. Configure the proxy to overwrite these headers with a single authority (`hostname[:port]`) and `http` or `https`. Use an `isrOrigin` on the canonical host so regeneration runs the canonical application hooks.
 
 ## Features by example
 
@@ -116,6 +131,10 @@ const result: RegenerateResult = await regenerate(['/isr/page', '/isr/server.jso
 await regenerate(['/isr/[slug]']);
 ```
 
+Page regeneration refreshes both HTML and its paired SvelteKit `__data.json`; endpoints remain single-file renders. Both page renders must succeed before either cached response is replaced. Failed HTTP responses, data load errors, redirects, malformed data, and response-body failures preserve last-known-good content. `removePaths` deletes the page/data pair and all `.br`/`.gz`/`.zst` variants. Route IDs with groups (for example `/(public)/[document]`) expand `entries()` without including the groups in public URLs; parameter values are URL-encoded.
+
+Workers check shared file metadata on every prerendered lookup, discover files created by peers even after a negative lookup, and recheck compressed variants rather than retaining stale file references. Per-path filesystem locks serialize regeneration and removal across workers; file replacements use atomic renames. Runtime locks and response MIME metadata live in `prerendered/.isr/`, which is excluded from public serving. This adds filesystem I/O to cache hits in exchange for cross-worker freshness. Unknown-path retry throttling remains bounded; a newly created file bypasses that throttle on the next lookup.
+
 `regenerate()` only works from inside a request while the built server is actually running (it throws otherwise). `RegenerateResult`:
 
 ```ts
@@ -179,14 +198,16 @@ Use `'auto'`, not `true`, on any route you want ISR on. `true` strips the route 
 ## How requests are resolved
 
 1. Static client assets
-2. Prerendered/ISR files — the in-memory index (built at boot, updated on every regenerate/remove) maps the path straight to its file on disk; file *bytes* are still read fresh from disk per request, only the lookup is O(1) in memory. A background regeneration is kicked off first if the file is older than its `revalidate` window
+2. Prerendered/ISR files — the per-worker index is checked against shared disk on each lookup. A background page-and-data regeneration is kicked off if the file is older than its `revalidate` window
 3. A path under an ISR-enabled route that has no prerendered file yet
 4. Everything else — normal SvelteKit SSR
+
+Steps 1–3 apply only to `GET`/`HEAD`. Steps 2–3 additionally require an allowed hostname when `isrHosts` is configured.
 
 ### Where this differs from stock SvelteKit
 
 - **Step 3 is the one real difference.** A path that matches an ISR-enabled route but has never been rendered (e.g. a fresh dynamic slug not covered by `entries()` at build time, and not yet regenerated on demand) gets a **404 immediately**, with rendering kicked off in the background for the *next* request — it does not block the current request on a live SSR render the way an ordinary SvelteKit dynamic route would. Call `regenerate()` (or wait for the request-after-next) once you know the path exists.
-- **Steps 1–3 use their own route matcher**, not SvelteKit's router, purely to decide "is this path governed by an ISR route." It mirrors SvelteKit's own specificity rules (static segments > matched params > plain params > rest params), so the outcome never disagrees with SvelteKit — it only exists to make that decision without going through full SSR. Step 4 hands off to SvelteKit's real router unchanged.
+- **Steps 2–3 use their own route matcher**, not SvelteKit's router, purely to decide "is this path governed by an ISR route." It orders static segments before matched params, plain params, and rest params. Step 4 hands off to SvelteKit's real router, including application rerouting and parameter matcher validation.
 
 ## File layout
 
@@ -205,10 +226,10 @@ build/
 
 ## Caveats
 
-- The prerendered-path index is per-process; under `cluster: true` each worker rebuilds it independently at boot, but they all read/write the same files on disk, so staleness is briefly worker-local at worst
+- Cluster workers must share the same writable `prerendered/` directory; file lookup checks and per-path locks coordinate its cache. Separate deployments with separate filesystems need their own regeneration calls
 - `prerender = 'auto'` is required for ISR — see above
 - `.zst` precompression is best-effort (skipped if unsupported by the running Bun build)
-- Manual `regenerate()` on a dynamic route id needs that route's `entries()` export — without it, the call no-ops for that id rather than erroring
+- Manual `regenerate()` on a dynamic route id needs that route's `entries()` export — an empty/missing export is reported in `failed`
 - `cluster: true` plus an external process manager both managing worker count will multiply concurrency — use one or the other
 
 ## Benchmarked performance
