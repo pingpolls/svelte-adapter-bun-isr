@@ -40,7 +40,7 @@
 	],
 	"scripts": {
 		"build": "rm -rf dist && bun build ./src/index.ts --outdir ./dist --target bun --minify && bunx --bun tsc --project tsconfig.build.json",
-		"release": "bun run build && bun test && bunx --bun npm publish --access public"
+		"release": "bun run build && bun test && bash scripts/publish.sh"
 	},
 	"peerDependencies": {
 		"@sveltejs/kit": ">=3.0.0"
