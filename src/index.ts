@@ -141,12 +141,32 @@ export default function (options: AdapterOptions = {}): Adapter {
 				};
 			}
 
+			// `prerender = true` dynamic routes are stripped from the SSR manifest, so the
+			// runtime can't match them via manifest.routes. Ship their patterns so unknown
+			// params get an instant static 404 instead of a full SSR round-trip.
+			const prerenderOnlyPatterns = builder.routes
+				.filter((route) => route.prerender === true && route.id.includes("["))
+				.map((route) => route.pattern.source);
+
+			// Kit 3 removed generateManifest: generate the server instance module
+			// and re-export its (otherwise private) manifest for the runtime.
+			const manifestFile = join(serverDest, "manifest.js");
+			builder.generateServerInstance(manifestFile, {
+				serverDirectory: serverDest,
+			});
+			const generated = await Bun.file(manifestFile).text();
+			if (!generated.includes("const manifest =")) {
+				throw new Error(
+					`[${ADAPTER_NAME}] Unexpected generateServerInstance output: no manifest found`,
+				);
+			}
 			await Bun.write(
-				join(serverDest, "manifest.js"),
+				manifestFile,
 				[
-					`export const manifest = ${builder.generateManifest({ relativePath: "./" })};`,
-					`export const base = ${JSON.stringify(builder.config.kit.paths.base)};`,
+					generated.replace("const manifest =", "export const manifest ="),
+					`export const base = ${JSON.stringify(builder.config.paths.base)};`,
 					`export const isrRoutes = ${JSON.stringify(isrRoutes)};`,
+					`export const prerenderOnlyPatterns = ${JSON.stringify(prerenderOnlyPatterns)};`,
 				].join("\n\n"),
 			);
 
@@ -337,9 +357,9 @@ function generateServerCode(opts: {
 
 	return `
 import { Server } from './server/index.js';
-import { manifest, base, isrRoutes } from './server/manifest.js';
+import { manifest, base, isrRoutes, prerenderOnlyPatterns } from './server/manifest.js';
 ${hasWebsocketExport ? "import { websocket } from './server/hooks.js';" : ""}
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { mkdir, open, readFile, readdir, rename, rmdir, stat, unlink, utimes } from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -380,13 +400,13 @@ await server.init({
  *    param > plain param > rest param), preserving SvelteKit's routing
  *    priority. Only the (typically small) dynamic subset is ever scanned.
  */
-const routesById = new Map(manifest._.routes.map((r) => [r.id, r]));
+const routesById = new Map(manifest.routes.map((r) => [r.id, r]));
 const staticRoutes = new Map();
 const dynamicRoutes = [];
 function routePath(id) {
   return id.split('/').filter((segment) => !/^\\(.*\\)$/.test(segment)).join('/') || '/';
 }
-for (const route of manifest._.routes) {
+for (const route of manifest.routes) {
   if (route.id.includes('[')) dynamicRoutes.push(route);
   else staticRoutes.set(routePath(route.id), route);
 }
@@ -464,18 +484,40 @@ async function indexPrerendered(dir, routeBase) {
 }
 await indexPrerendered(PRERENDERED_DIR, '');
 
+/** Sync stat that treats ENOENT/ENOTDIR (missing path) as null; cheaper than an async stat on the miss path. */
+function statSyncOrNull(file) {
+  try {
+    return statSync(file, { throwIfNoEntry: false }) ?? null;
+  } catch (err) {
+    if (err.code === 'ENOTDIR') return null;
+    throw err;
+  }
+}
+function isFileSync(file) {
+  return statSyncOrNull(file)?.isFile() === true;
+}
+
 async function lookupPrerendered(path) {
   if (path === '/.isr' || path.startsWith('/.isr/')) return null;
   const previous = prerendered.get(path);
+  // Hot path: one synchronous stat confirms the indexed file is unchanged on
+  // shared disk, so peers' replacements and deletions are still seen immediately.
+  if (previous) {
+    const current = statSync(previous.file, { throwIfNoEntry: false });
+    if (current?.isFile() && current.mtimeMs === previous.timestamp && current.size === previous.size) return previous;
+  }
   const candidates = [...new Set([previous?.file, prerenderedDiskPath(path), join(PRERENDERED_DIR, path, 'index.html')].filter(Boolean))];
   for (const file of candidates) {
-    const stats = await stat(file).catch((err) => {
-      if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return null;
-      throw err;
-    });
+    const stats = statSyncOrNull(file);
     if (!stats?.isFile()) continue;
     const metadata = await readFile(metadataPath(path), 'utf8').catch((err) => { if (err.code === 'ENOENT') return null; throw err; });
     const entry = { file, type: metadata ? JSON.parse(metadata).type : previous?.type || Bun.file(file).type, timestamp: stats.mtimeMs, size: stats.size };
+    if (previous?.file === file && previous.timestamp === stats.mtimeMs && previous.size === stats.size) {
+      // Unchanged on disk: keep derived per-entry caches (revalidate, encodings).
+      previous.type = entry.type;
+      missingPathsCache.delete(path);
+      return previous;
+    }
     prerendered.set(path, entry);
     missingPathsCache.delete(path);
     return entry;
@@ -511,7 +553,7 @@ async function negotiateCompressed(filePath, acceptEncoding) {
     if (!accepts.includes(encoding)) continue;
     const file = Bun.file(filePath + ext);
     const [source, compressed] = await Promise.all([stat(filePath).catch(() => null), stat(filePath + ext).catch(() => null)]);
-    if (source?.isFile() && compressed?.isFile() && compressed.mtimeMs >= source.mtimeMs) return { file, encoding };
+    if (source?.isFile() && compressed?.isFile() && compressed.mtimeMs >= source.mtimeMs) return { file, encoding, path: filePath + ext };
   }
   return null;
 }
@@ -659,7 +701,7 @@ async function expandEntries(routeId) {
   const route = routesById.get(routeId);
   const nodeIndex = route?.page?.leaf;
   if (nodeIndex === undefined) return null;
-  const node = await manifest._.nodes[nodeIndex]();
+  const node = await manifest.nodes[nodeIndex]();
   const entriesFn = node?.server?.entries ?? node?.universal?.entries;
   if (typeof entriesFn !== 'function') return [];
   const paramSets = (await entriesFn()) || [];
@@ -757,23 +799,38 @@ if (isrRouteCount > 0 && (workerIndex === undefined || workerIndex === '0')) {
   console.log(\`[\${ADAPTER_NAME}] ISR enabled for \${isrRouteCount} route pattern(s), serving from \${PRERENDERED_DIR}\`);
 }
 
-/** Serve (and lazily cache) the static 404 page for ISR-blocked paths. */
-async function get404Response() {
-  const fallback404Path = join(PRERENDERED_DIR, '404.html');
-  const fallbackFile = Bun.file(fallback404Path);
-  if (await fallbackFile.exists()) {
-    return new Response(fallbackFile, { status: 404, headers: { 'content-type': 'text/html; charset=utf-8' } });
-  }
-  try {
-    const res = await server.respond(new Request(ISR_ORIGIN + '/__404__'), {
-      getClientAddress: () => '127.0.0.1',
-    });
-    const html = await res.arrayBuffer();
-    await Bun.write(fallback404Path, html);
-    return new Response(html, { status: 404, headers: { 'content-type': 'text/html; charset=utf-8' } });
-  } catch {
-    return new Response('Not Found', { status: 404 });
-  }
+/** Prerender-only (\`prerender = true\`) dynamic route patterns; no SSR manifest entry exists for them. */
+const prerenderOnlyRoutes = prerenderOnlyPatterns.map((source) => new RegExp(source));
+function isPrerenderOnlyPath(pathname) {
+  if (base && pathname !== base && !pathname.startsWith(base + '/')) return false;
+  const relative = base ? pathname.slice(base.length) || '/' : pathname;
+  return prerenderOnlyRoutes.some((pattern) => pattern.test(relative));
+}
+
+/** The 404 page is read (or rendered once) and then held in memory: no disk or DB access per miss. */
+let notFoundPayload;
+function loadNotFound() {
+  return (notFoundPayload ??= (async () => {
+    const fallback404Path = join(PRERENDERED_DIR, '404.html');
+    const fallbackFile = Bun.file(fallback404Path);
+    try {
+      if (await fallbackFile.exists()) return await fallbackFile.bytes();
+      const res = await server.respond(new Request(ISR_ORIGIN + '/__404__'), {
+        getClientAddress: () => '127.0.0.1',
+      });
+      const html = new Uint8Array(await res.arrayBuffer());
+      await Bun.write(fallback404Path, html);
+      return html;
+    } catch {
+      return new TextEncoder().encode('Not Found');
+    }
+  })());
+}
+const NOT_FOUND_HEADERS = { 'content-type': 'text/html; charset=utf-8' };
+
+async function notFound(method) {
+  const body = await loadNotFound();
+  return new Response(method === 'HEAD' ? null : body, { status: 404, headers: NOT_FOUND_HEADERS });
 }
 
 const bunServer = Bun.serve({
@@ -821,7 +878,7 @@ const bunServer = Bun.serve({
       if (relativePath !== '/' && relativePath !== '') {
         const assetPath = join(ASSET_DIR, relativePath);
         const assetFile = Bun.file(assetPath);
-        if (await assetFile.exists()) {
+        if (isFileSync(assetPath)) {
           const headers = { vary: 'Accept-Encoding' };
           if (relativePath.startsWith('/_app/immutable/')) {
             headers['cache-control'] = 'public,max-age=31536000,immutable';
@@ -857,7 +914,16 @@ const bunServer = Bun.serve({
         const freshFile = Bun.file(filePath);
         const headers = { 'content-type': type || 'text/html; charset=utf-8', vary: 'Accept-Encoding' };
 
-        const compressed = await negotiateCompressed(filePath, acceptEncoding);
+        // Encoding choice is memoized per entry; it resets whenever the entry is replaced.
+        const encodingKey = acceptEncoding ?? '';
+        entry.encodings ??= new Map();
+        let compressed = entry.encodings.get(encodingKey);
+        if (compressed && !statSync(compressed.path, { throwIfNoEntry: false })?.isFile()) compressed = undefined;
+        if (compressed === undefined) {
+          compressed = await negotiateCompressed(filePath, acceptEncoding);
+          if (entry.encodings.size >= 8) entry.encodings.clear();
+          entry.encodings.set(encodingKey, compressed);
+        }
         if (compressed) {
           headers['content-encoding'] = compressed.encoding;
           return cachedResponse(compressed.file, { headers });
@@ -880,8 +946,12 @@ const bunServer = Bun.serve({
           regenerateIsr(pathname); // writes to disk for the *next* request if it now exists
         }
       }
-      const response = await get404Response();
-      return request.method === 'HEAD' ? new Response(null, { status: response.status, headers: response.headers }) : response;
+      return notFound(request.method);
+    }
+
+    /** 3b. \`prerender = true\` route, file not in the build: it can never exist, so 404 without touching SSR/DB. */
+    if (safeMethod && isrHost && !route && isPrerenderOnlyPath(pagePath(pathname))) {
+      return notFound(request.method);
     }
 
     /** 4. Everything else: normal dynamic SSR. */

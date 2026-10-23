@@ -318,7 +318,10 @@ describe("Manual regeneration API & dynamic ISR routes", () => {
 		const result = await postRegenerate(["/isr/hello-world"]);
 
 		expect(result.failed).toEqual([]);
-		expect(result.created).toContain("/isr/hello-world");
+		// POST /api/todos already created the slug page; the explicit call refreshes it.
+		expect([...result.created, ...result.regenerated]).toContain(
+			"/isr/hello-world",
+		);
 		expect((await fetch(`${baseUrl}/isr/hello-world`)).ok).toBe(true);
 		const dataResponse = await fetch(`${baseUrl}/isr/hello-world/__data.json`);
 		expect(dataResponse.status).toBe(200);
@@ -352,6 +355,72 @@ describe("Manual regeneration API & dynamic ISR routes", () => {
 				path.join(BUILD_DIR, "prerendered/isr/hello-world/__data.json"),
 			).exists(),
 		).toBe(false);
+	});
+});
+
+describe("SSR, static and ISR slug behavior", () => {
+	let server: import("bun").Subprocess | null = null;
+	const port = BASE_PORT + 3;
+	const baseUrl = `http://localhost:${port}`;
+
+	beforeAll(async () => {
+		server = await startAppServer(port);
+	});
+
+	afterAll(async () => {
+		await stopAppServer(server, port);
+	});
+
+	test("SSR page (prerender = false) renders live on every request", async () => {
+		const before = await fetchPageSections(baseUrl, "/ssr/page");
+		await createTodo(baseUrl, "ssr todo");
+		const after = await fetchPageSections(baseUrl, "/ssr/page");
+		expect(after.length).toBe(before.length + 1);
+
+		const stamp = async () =>
+			(await (await fetch(`${baseUrl}/ssr/page`)).text()).match(
+				/data-testid="rendered-at"[^>]*>(\d+)</,
+			)?.[1];
+		const first = await stamp();
+		await Bun.sleep(5);
+		expect(await stamp()).not.toBe(first);
+	});
+
+	test("unknown /isr/[slug] and /no-isr/[slug] are plain 404s", async () => {
+		for (const p of ["/isr/nope", "/no-isr/nope"]) {
+			const res = await fetch(`${baseUrl}${p}`);
+			expect(res.status).toBe(404);
+			expect(res.headers.get("content-type")).toContain("text/html");
+			await res.text();
+		}
+	});
+
+	test("adding a todo makes /isr/[slug] appear but /no-isr/[slug] stays 404", async () => {
+		await createTodo(baseUrl, "Brand New Todo");
+
+		let isr = await fetch(`${baseUrl}/isr/brand-new-todo`);
+		for (let i = 0; i < SWR_POLL_RETRIES && isr.status !== 200; i++) {
+			await Bun.sleep(SWR_POLL_DELAY_MS);
+			isr = await fetch(`${baseUrl}/isr/brand-new-todo`);
+		}
+		expect(isr.status).toBe(200);
+		expect(await isr.text()).toContain("brand-new-todo");
+
+		const staticRes = await fetch(`${baseUrl}/no-isr/brand-new-todo`);
+		expect(staticRes.status).toBe(404);
+		await Bun.sleep(500);
+		expect((await fetch(`${baseUrl}/no-isr/brand-new-todo`)).status).toBe(404);
+	});
+
+	test("404 for missing prerendered slugs is served without regeneration or SSR", async () => {
+		const started = performance.now();
+		for (let i = 0; i < 200; i++) {
+			const res = await fetch(`${baseUrl}/no-isr/missing-${i}`);
+			expect(res.status).toBe(404);
+			await res.arrayBuffer();
+		}
+		// Generous bound (~25ms/request): a DB-backed SSR round-trip per miss would blow past it.
+		expect(performance.now() - started).toBeLessThan(5000);
 	});
 });
 

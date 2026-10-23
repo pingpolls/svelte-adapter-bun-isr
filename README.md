@@ -207,6 +207,7 @@ Steps 1–3 apply only to `GET`/`HEAD`. Steps 2–3 additionally require an allo
 ### Where this differs from stock SvelteKit
 
 - **Step 3 is the one real difference.** A path that matches an ISR-enabled route but has never been rendered (e.g. a fresh dynamic slug not covered by `entries()` at build time, and not yet regenerated on demand) gets a **404 immediately**, with rendering kicked off in the background for the *next* request — it does not block the current request on a live SSR render the way an ordinary SvelteKit dynamic route would. Call `regenerate()` (or wait for the request-after-next) once you know the path exists.
+- **Missing paths never touch SSR or your database.** The 404 page is held in memory, so a miss costs a couple of `stat` calls plus a memory copy. The same applies to `prerender = true` dynamic routes (e.g. `/no-isr/[slug]`): they are fully static, so a param that wasn't prerendered at build time gets the same instant 404 and is never discovered at runtime.
 - **Steps 2–3 use their own route matcher**, not SvelteKit's router, purely to decide "is this path governed by an ISR route." It orders static segments before matched params, plain params, and rest params. Step 4 hands off to SvelteKit's real router, including application rerouting and parameter matcher validation.
 
 ## File layout
@@ -237,7 +238,7 @@ build/
 Load-tested with `wrk` (5m, 4 threads, 512 connections) against `svelte-adapter-bun` on:
 
 - Intel i7-13700H (Only 2 CPU utilized for the test)
-- 32 GB of RAM
+- 16 GB of RAM
 
 ![Throughput comparison: svelte-adapter-bun vs @pingpolls/svelte-adapter-bun-isr](https://raw.githubusercontent.com/pingpolls/svelte-adapter-bun-isr/refs/heads/main/benchmark/throughput-v107.webp)
 

@@ -51,7 +51,7 @@ async function build(options: Parameters<typeof adapter>[0] = {}) {
 	builds.push(dir);
 	mkdirSync(join(dir, "temp"), { recursive: true });
 	const builder = {
-		config: { kit: { paths: { base: "" } } },
+		config: { paths: { base: "" } },
 		routes: [
 			{
 				id: "/(public)/[document]",
@@ -70,16 +70,18 @@ async function build(options: Parameters<typeof adapter>[0] = {}) {
 		},
 		writePrerendered() {},
 		writeServer() {},
-		generateManifest: () => `{
-      _: {
+		generateServerInstance: (dest: string) =>
+			writeFileSync(
+				dest,
+				`const manifest = {
         routes: [
           { id: '/(public)/fixed', pattern: /^\\/fixed$/, page: { leaf: 0 } },
           { id: '/(public)', pattern: /^\\/$/, page: { leaf: 0 } },
           { id: '/(public)/[document]', pattern: /^\\/[^/]+\\/?$/, page: { leaf: 0 } }
         ],
         nodes: [async () => ({ server: { entries: async () => [{ document: 'fresh' }, { document: 'with space' }] } })]
-      }
-    }`,
+    };`,
+			),
 	};
 	builder.writePrerendered = (dest?: string) => {
 		if (!dest) throw new Error("missing destination");
