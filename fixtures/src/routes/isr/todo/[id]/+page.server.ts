@@ -1,5 +1,5 @@
 import { error } from "@sveltejs/kit";
-import { getTodo, getTodos } from "$lib/server/db";
+import { getTodo, getTodos } from "#lib/server/db.ts";
 import type { EntryGenerator, PageServerLoad } from "./$types";
 
 export const prerender = "auto";

@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import * as path from "node:path";
-import type { Todo } from "$src/app";
+import type { Todo } from "#src/app.d.ts";
 
 // Use a consistent path relative to the project root where the fixture runs.
 const dbPath = path.resolve(process.cwd(), "db.sqlite");
@@ -19,6 +19,7 @@ export function addTodo(text: string) {
 	const slug = slugify(text);
 
 	db.run("INSERT INTO todos (text, slug) VALUES (?, ?)", [text, slug]);
+	return slug;
 }
 
 export function getTodos() {

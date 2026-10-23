@@ -10,9 +10,8 @@ export default defineConfig({
 			adapter: BunISRAdapter({
 				precompress: false,
 			}),
-			alias: {
-				$src: "./src",
-			},
+			// /no-isr/[slug] has no entries on an empty DB; that is the point of the fixture.
+			prerender: { handleUnseenRoutes: "ignore" },
 			compilerOptions: {
 				// Force runes mode for the project, except for libraries. Can be removed in svelte 6.
 				runes: ({ filename }) =>

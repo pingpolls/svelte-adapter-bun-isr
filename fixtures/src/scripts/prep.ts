@@ -1,3 +1,3 @@
-import { clearTodos } from "$src/lib/server/db";
+import { clearTodos } from "#lib/server/db.ts";
 
 clearTodos();

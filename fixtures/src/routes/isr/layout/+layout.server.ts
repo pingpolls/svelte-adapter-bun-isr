@@ -1,4 +1,4 @@
-import { getTodos } from "$lib/server/db";
+import { getTodos } from "#lib/server/db.ts";
 import type { Config } from "../../../../../src";
 import type { LayoutServerLoad } from "./$types";
 

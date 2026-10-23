@@ -1,5 +1,5 @@
 import { json } from "@sveltejs/kit";
-import { getTodos } from "$src/lib/server/db";
+import { getTodos } from "#lib/server/db.ts";
 import type { Config } from "../../../../../src";
 
 export const prerender = "auto";

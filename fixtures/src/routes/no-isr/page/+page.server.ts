@@ -1,4 +1,4 @@
-import { getTodos } from "$lib/server/db";
+import { getTodos } from "#lib/server/db.ts";
 import type { PageServerLoad } from "../../no-isr/page/$types";
 
 export const prerender = true;
