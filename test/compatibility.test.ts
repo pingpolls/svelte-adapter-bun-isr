@@ -1,5 +1,12 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { join, relative } from "node:path";
 import type { Builder } from "@sveltejs/kit";
 import adapter from "../src/index.ts";
@@ -18,7 +25,10 @@ import { join } from 'node:path';
 const stateFile = join(import.meta.dir, '../state.json');
 const registry = '@pingpolls/svelte-adapter-bun-isr/registry';
 export class Server {
-  async init() {}
+  async init() {
+    const hooks = join(import.meta.dir, '../hooks-test.js');
+    if (await Bun.file(hooks).exists()) await import(hooks);
+  }
   async respond(request) {
     const url = new URL(request.url);
     if (url.pathname === '/api/regenerate') {
@@ -31,7 +41,7 @@ export class Server {
     }
     const state = await Bun.file(stateFile).json();
     if (url.hostname === 'custom.example') {
-      return new Response(request.method === 'HEAD' ? null : 'custom SSR ' + url.pathname + ' ' + url.origin);
+      return new Response(request.method === 'HEAD' ? null : 'custom SSR ' + url.pathname + ' ' + url.origin, { headers: { 'content-type': 'text/plain' } });
     }
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       return new Response('SSR action ' + request.method + ' ' + url.pathname, { status: 201 });
@@ -121,10 +131,10 @@ async function start(dir: string, extraEnv: Record<string, string> = {}) {
 			if (done)
 				throw new Error(output + (await new Response(proc.stderr).text()));
 			output += new TextDecoder().decode(value);
-			const port = output.match(
-				/listening on http:\/\/127\.0\.0\.1:(\d+)/,
-			)?.[1];
-			if (port) return `http://127.0.0.1:${port}`;
+			const match = output.match(
+				/listening on (https?):\/\/127\.0\.0\.1:(\d+)/,
+			);
+			if (match) return `${match[1]}://127.0.0.1:${match[2]}`;
 		}
 	};
 	return await Promise.race([
@@ -498,4 +508,261 @@ test("an empty allowlist disables all prerender/unknown-ISR interception; prefix
 			`custom SSR /doc ${origin}`,
 		);
 	}
+});
+
+// Stand-in for an app's hooks.server: queue workers behind singleton(), Bun-level gates via intercept().
+const hooksSource = `
+import { appendFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { intercept, sharedStore, singleton, workerInfo } from ${JSON.stringify(join(import.meta.dir, "../src/index.ts"))};
+const log = join(import.meta.dir, 'singletons.log');
+await singleton('jobs', () => appendFileSync(log, JSON.stringify(workerInfo()) + '\\n'), {
+  dispose: () => appendFileSync(log, 'disposed\\n'),
+});
+await singleton('jobs', () => appendFileSync(log, 'duplicate\\n'));
+const limits = sharedStore('limits');
+intercept(
+  (request) => {
+    const id = request.headers.get('x-id');
+    if (id && limits.hit(id, 60) > 5) return new Response('limited', { status: 429 });
+  },
+  (request) => (new URL(request.url).pathname === '/wp-login.php' ? new Response('honeypot', { status: 451 }) : undefined),
+  async (request) => (request.headers.get('x-block') ? new Response('limited', { status: 429 }) : undefined),
+);
+`;
+
+async function buildWithHooks(options: Parameters<typeof adapter>[0] = {}) {
+	const dir = await build({ precompress: false, ...options });
+	writeFileSync(join(dir, "hooks-test.js"), hooksSource);
+	return dir;
+}
+
+function singletonLog(dir: string) {
+	const file = join(dir, "singletons.log");
+	return existsSync(file)
+		? readFileSync(file, "utf8").trim().split("\n").filter(Boolean)
+		: [];
+}
+
+async function waitFor(check: () => boolean, label: string) {
+	const deadline = Date.now() + 10000;
+	while (!check()) {
+		if (Date.now() > deadline) throw new Error(`Timed out waiting: ${label}`);
+		await Bun.sleep(50);
+	}
+}
+
+describe("intercept and singleton", () => {
+	test("interceptors answer before assets, ISR and SSR; the rest pass through", async () => {
+		const dir = await buildWithHooks();
+		const url = await start(dir);
+		const honeypot = await fetch(`${url}/wp-login.php`);
+		expect(honeypot.status).toBe(451);
+		expect(await honeypot.text()).toBe("honeypot");
+		for (const path of ["/asset.txt", "/doc", "/absent"]) {
+			const limited = await fetch(url + path, { headers: { "x-block": "1" } });
+			expect(limited.status).toBe(429);
+		}
+		expect(await (await fetch(`${url}/asset.txt`)).text()).toBe("static asset");
+		expect(await (await fetch(`${url}/doc`)).text()).toBe("HTML cached v0");
+	});
+
+	test("a standalone server runs each singleton key once and disposes it on SIGTERM", async () => {
+		const dir = await buildWithHooks();
+		await start(dir);
+		const proc = workers.at(-1) as import("bun").Subprocess;
+		const [info] = singletonLog(dir);
+		expect(JSON.parse(info as string)).toEqual({
+			role: "http",
+			index: 0,
+			count: 1,
+			backgroundWorkers: 0,
+			standalone: false,
+		});
+		proc.kill("SIGTERM");
+		expect(await proc.exited).toBe(0);
+		expect(singletonLog(dir)).toEqual([info as string, "disposed"]);
+	});
+
+	test("the cluster runs singletons once, in the background worker, never in HTTP workers", async () => {
+		const dir = await buildWithHooks({ cluster: true });
+		const url = await start(dir, { CPUS: "3", BACKGROUND_WORKERS: "1" });
+		await waitFor(() => singletonLog(dir).length > 0, "background singleton");
+		// Every HTTP worker has booted (and evaluated hooks) by the time all answer.
+		await Promise.all(
+			Array.from({ length: 30 }, () => fetch(`${url}/wp-login.php`)),
+		);
+		await Bun.sleep(200);
+		const entries = singletonLog(dir);
+		expect(entries).toHaveLength(1);
+		expect(JSON.parse(entries[0] as string)).toMatchObject({
+			role: "background",
+			index: 0,
+			count: 1,
+			backgroundWorkers: 1,
+		});
+		// Shutdown reaches the background process' dispose hook too.
+		const supervisor = workers.at(-1) as import("bun").Subprocess;
+		supervisor.kill("SIGTERM");
+		await supervisor.exited;
+		await waitFor(
+			() => singletonLog(dir).includes("disposed"),
+			"background dispose",
+		);
+	});
+
+	test("without background workers the cluster uses HTTP worker 0 only", async () => {
+		const dir = await buildWithHooks({ cluster: true });
+		const url = await start(dir, { CPUS: "3" });
+		await Promise.all(
+			Array.from({ length: 30 }, () => fetch(`${url}/wp-login.php`)),
+		);
+		await waitFor(() => singletonLog(dir).length > 0, "http singleton");
+		await Bun.sleep(200);
+		const entries = singletonLog(dir);
+		expect(entries).toHaveLength(1);
+		expect(JSON.parse(entries[0] as string)).toMatchObject({
+			role: "http",
+			index: 0,
+			count: 3,
+		});
+	});
+});
+
+describe("sharedStore", () => {
+	test("counters are shared by every worker of the cluster", async () => {
+		const dir = await buildWithHooks({ cluster: true });
+		const url = await start(dir, { CPUS: "3" });
+		const statuses: number[] = [];
+		for (let i = 0; i < 12; i++) {
+			// No keep-alive: connections spread across the three reuseport workers.
+			const res = await fetch(`${url}/doc`, {
+				keepalive: false,
+				headers: { "x-id": "client-1", connection: "close" },
+			});
+			statuses.push(res.status);
+		}
+		expect(statuses.filter((status) => status === 200)).toHaveLength(5);
+		expect(statuses.filter((status) => status === 429)).toHaveLength(7);
+		// Another key has its own window.
+		const other = await fetch(`${url}/doc`, {
+			headers: { "x-id": "client-2" },
+		});
+		expect(other.status).toBe(200);
+	});
+});
+
+describe("TLS", () => {
+	test("serves HTTPS from TLS_SERVER_CERT/TLS_SERVER_KEY files with mode 0400", async () => {
+		const dir = await build({ precompress: false });
+		const cert = join(dir, "cert.pem");
+		const key = join(dir, "key.pem");
+		const openssl = Bun.spawnSync([
+			"openssl",
+			"req",
+			"-x509",
+			"-newkey",
+			"rsa:2048",
+			"-nodes",
+			"-subj",
+			"/CN=127.0.0.1",
+			"-days",
+			"1",
+			"-keyout",
+			key,
+			"-out",
+			cert,
+		]);
+		expect(openssl.exitCode).toBe(0);
+		chmodSync(cert, 0o400);
+		chmodSync(key, 0o400);
+		const url = await start(dir, {
+			TLS_SERVER_CERT: cert,
+			TLS_SERVER_KEY: key,
+		});
+		expect(url.startsWith("https://")).toBe(true);
+		const response = await fetch(`${url}/doc`, {
+			tls: { rejectUnauthorized: false },
+		});
+		expect(await response.text()).toBe("HTML cached v0");
+	});
+
+	test("refuses to start with only one of the TLS paths, or an unreadable one", async () => {
+		const dir = await build({ precompress: false });
+		for (const env of [
+			{ TLS_SERVER_CERT: join(dir, "cert.pem") },
+			{
+				TLS_SERVER_CERT: join(dir, "missing.pem"),
+				TLS_SERVER_KEY: join(dir, "missing.pem"),
+			},
+		]) {
+			const proc = Bun.spawn({
+				cmd: [process.execPath, join(dir, "index.js")],
+				env: { ...process.env, PORT: "0", HOST: "127.0.0.1", ...env },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(await proc.exited).not.toBe(0);
+			expect(await new Response(proc.stderr).text()).toContain("TLS_SERVER_");
+		}
+	});
+});
+
+describe("compress", () => {
+	const ssr = (url: string, encoding: string) =>
+		fetch(`${url}/page`, {
+			decompress: false,
+			headers: {
+				"x-forwarded-host": "custom.example",
+				"x-forwarded-proto": "https",
+				"accept-encoding": encoding,
+			},
+		});
+
+	test("is off by default: SSR responses are sent as-is", async () => {
+		const url = await start(await build({ precompress: false, isrHosts: [] }), {
+			HOST_HEADER: "x-forwarded-host",
+			PROTOCOL_HEADER: "x-forwarded-proto",
+		});
+		const res = await ssr(url, "zstd, gzip");
+		expect(res.headers.get("content-encoding")).toBeNull();
+		expect(await res.text()).toBe("custom SSR /page https://custom.example");
+	});
+
+	test("compresses SSR responses with zstd, then gzip, honoring q=0", async () => {
+		const url = await start(
+			await build({ precompress: false, compress: true, isrHosts: [] }),
+			{
+				HOST_HEADER: "x-forwarded-host",
+				PROTOCOL_HEADER: "x-forwarded-proto",
+			},
+		);
+		for (const [header, expected] of [
+			["gzip, zstd", "zstd"],
+			["gzip, deflate, br", "gzip"],
+			["zstd;q=0, gzip", "gzip"],
+			["br", null],
+			["identity", null],
+		] as const) {
+			const res = await ssr(url, header);
+			expect(res.headers.get("content-encoding")).toBe(expected);
+			if (expected)
+				expect(res.headers.get("vary")).toContain("Accept-Encoding");
+			const bytes = new Uint8Array(await res.arrayBuffer());
+			const body =
+				expected === "zstd"
+					? Bun.zstdDecompressSync(bytes)
+					: expected === "gzip"
+						? Bun.gunzipSync(bytes)
+						: bytes;
+			expect(new TextDecoder().decode(body)).toBe(
+				"custom SSR /page https://custom.example",
+			);
+		}
+		// Static assets keep their own (precompressed) path and are not recompressed.
+		const asset = await fetch(`${url}/asset.txt`, {
+			headers: { "accept-encoding": "identity" },
+		});
+		expect(asset.headers.get("content-encoding")).toBeNull();
+	});
 });

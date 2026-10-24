@@ -460,8 +460,141 @@ describe("Websockets and adapter options", () => {
 		expect(
 			await Bun.file(path.join(BUILD_DIR, "server", "manifest.js")).exists(),
 		).toBe(true);
+		// The websocket export comes from SvelteKit's own hooks entry (one module
+		// instance), so no second hooks.js bundle is emitted.
 		expect(
 			await Bun.file(path.join(BUILD_DIR, "server", "hooks.js")).exists(),
-		).toBe(true);
+		).toBe(false);
+		expect(await Bun.file(path.join(BUILD_DIR, "app.js")).text()).toContain(
+			'await import("./server/entries/hooks.server.js")',
+		);
+	});
+});
+
+describe("SSR micro-cache (config.ssrCache)", () => {
+	let server: import("bun").Subprocess | null = null;
+	const port = BASE_PORT + 4;
+	const baseUrl = `http://localhost:${port}`;
+
+	// The cache is per worker process and the fixture runs 2 workers, so a burst of fresh
+	// connections is used instead of assuming which worker answers.
+	const burst = (urlPath: string, init: RequestInit = {}, n = 24) =>
+		Promise.all(
+			Array.from({ length: n }, async () => {
+				const res = await fetch(`${baseUrl}${urlPath}`, {
+					...init,
+					headers: { connection: "close", ...init.headers },
+				});
+				return { res, body: await res.text() };
+			}),
+		);
+
+	beforeAll(async () => {
+		server = await startAppServer(port);
+	});
+
+	afterAll(async () => {
+		await stopAppServer(server, port);
+	});
+
+	test("anonymous GETs are served from cache, at most one render per worker", async () => {
+		const seen = await burst("/ssr/cached");
+		const stamps = new Set(
+			seen.map(({ body }) => body.match(/data-testid="rendered-at"[^>]*>(\d+)</)?.[1]),
+		);
+		expect(stamps.size).toBeLessThanOrEqual(2);
+		expect(seen.some(({ res }) => res.headers.get("x-ssr-cache") === "HIT")).toBe(true);
+	});
+
+	test("entries expire after the TTL", async () => {
+		const stamp = async () =>
+			(await (await fetch(`${baseUrl}/ssr/cached?ttl`)).text()).match(
+				/data-testid="rendered-at"[^>]*>(\d+)</,
+			)?.[1];
+		const first = new Set((await burst("/ssr/cached?ttl")).map(({ body }) => body));
+		await Bun.sleep(2300);
+		const later = new Set((await burst("/ssr/cached?ttl")).map(({ body }) => body));
+		expect([...later].every((body) => !first.has(body))).toBe(true);
+		expect(await stamp()).toBeDefined();
+	});
+
+	test("each query string is its own entry", async () => {
+		const a = await burst("/ssr/cached?k=a", {}, 8);
+		const b = await burst("/ssr/cached?k=b", {}, 8);
+		const stamps = (rows: typeof a) =>
+			new Set(rows.map(({ body }) => body.match(/>(\d{13})</)?.[1]));
+		// Different keys render independently, so they cannot be forced to share a stamp set.
+		expect(stamps(a).size).toBeGreaterThan(0);
+		expect(stamps(b).size).toBeGreaterThan(0);
+	});
+
+	test("requests with an unknown cookie or an Authorization header bypass the cache", async () => {
+		for (const headers of [
+			{ cookie: "session=abc" },
+			{ authorization: "Bearer token" },
+		]) {
+			const seen = await burst("/ssr/cached", { headers });
+			expect(seen.every(({ res }) => res.headers.get("x-ssr-cache") === null)).toBe(true);
+		}
+	});
+
+	test("cookie opt-outs: only listed cookies are ignored, others still bypass", async () => {
+		const warm = await burst("/ssr/cookie", { headers: { cookie: "_ga=1" } });
+		expect(warm.some(({ res }) => res.headers.get("x-ssr-cache") === "HIT")).toBe(true);
+		const mixed = await burst("/ssr/cookie", { headers: { cookie: "_ga=1; session=abc" } });
+		expect(mixed.every(({ res }) => res.headers.get("x-ssr-cache") === null)).toBe(true);
+	});
+
+	test("a response that sets a cookie is never cached or shared", async () => {
+		const seen = await burst("/ssr/cookie?set=1");
+		expect(seen.every(({ res }) => res.headers.get("x-ssr-cache") === null)).toBe(true);
+		expect(seen.every(({ res }) => res.headers.get("set-cookie") !== null)).toBe(true);
+	});
+
+	test("Vary splits entries by request header, so visitors never see each other's variant", async () => {
+		const [a, b] = await Promise.all([
+			burst("/ssr/vary", { headers: { "x-variant": "a" } }),
+			burst("/ssr/vary", { headers: { "x-variant": "b" } }),
+		]);
+		for (const { body } of a) expect(JSON.parse(body).variant).toBe("a");
+		for (const { body } of b) expect(JSON.parse(body).variant).toBe("b");
+		const again = await burst("/ssr/vary", { headers: { "x-variant": "a" } });
+		expect(again.some(({ res }) => res.headers.get("x-ssr-cache") === "HIT")).toBe(true);
+		for (const { body } of again) expect(JSON.parse(body).variant).toBe("a");
+	});
+
+	test("a header the route reads without Vary still splits the cache", async () => {
+		const [a, b] = await Promise.all([
+			burst("/ssr/tenant", { headers: { "x-tenant": "acme" } }),
+			burst("/ssr/tenant", { headers: { "x-tenant": "globex" } }),
+		]);
+		// Whatever order the workers learned the dependency in, nobody sees another tenant's render.
+		for (const { body } of a) expect(JSON.parse(body).tenant).toBe("acme");
+		for (const { body } of b) expect(JSON.parse(body).tenant).toBe("globex");
+		const again = await burst("/ssr/tenant", { headers: { "x-tenant": "acme" } });
+		for (const { body } of again) expect(JSON.parse(body).tenant).toBe("acme");
+		expect(again.some(({ res }) => res.headers.get("x-ssr-cache") === "HIT")).toBe(true);
+		const none = await burst("/ssr/tenant");
+		for (const { body } of none) expect(JSON.parse(body).tenant).toBeNull();
+	});
+
+	test("renders that read the client address or enumerate headers are never cached", async () => {
+		for (const route of ["/ssr/addr", "/ssr/enum"]) {
+			const seen = await burst(route);
+			expect(seen.every(({ res }) => res.headers.get("x-ssr-cache") === null)).toBe(true);
+			expect(new Set(seen.map(({ body }) => body)).size).toBeGreaterThan(1);
+		}
+	});
+
+	test("HEAD and POST never touch the cache", async () => {
+		const head = await fetch(`${baseUrl}/ssr/cached`, { method: "HEAD" });
+		expect(head.headers.get("x-ssr-cache")).toBeNull();
+		await head.text();
+	});
+
+	test("routes without ssrCache are untouched", async () => {
+		const res = await fetch(`${baseUrl}/ssr/page`);
+		expect(res.headers.get("x-ssr-cache")).toBeNull();
+		await res.text();
 	});
 });
