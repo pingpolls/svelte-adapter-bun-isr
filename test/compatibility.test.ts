@@ -1,6 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
-	chmodSync,
 	existsSync,
 	mkdirSync,
 	readFileSync,
@@ -653,8 +652,8 @@ describe("sharedStore", () => {
 });
 
 describe("TLS", () => {
-	test("serves HTTPS from TLS_SERVER_CERT/TLS_SERVER_KEY files with mode 0400", async () => {
-		const dir = await build({ precompress: false });
+	/** A self-signed certificate followed by its key, as one PEM string. */
+	function originPem(dir: string) {
 		const cert = join(dir, "cert.pem");
 		const key = join(dir, "key.pem");
 		const openssl = Bun.spawnSync([
@@ -674,37 +673,42 @@ describe("TLS", () => {
 			cert,
 		]);
 		expect(openssl.exitCode).toBe(0);
-		chmodSync(cert, 0o400);
-		chmodSync(key, 0o400);
-		const url = await start(dir, {
-			TLS_SERVER_CERT: cert,
-			TLS_SERVER_KEY: key,
-		});
-		expect(url.startsWith("https://")).toBe(true);
-		const response = await fetch(`${url}/doc`, {
-			tls: { rejectUnauthorized: false },
-		});
-		expect(await response.text()).toBe("HTML cached v0");
+		return {
+			cert: readFileSync(cert, "utf8"),
+			pem: readFileSync(cert, "utf8") + readFileSync(key, "utf8"),
+		};
+	}
+
+	test("serves HTTPS from the PEM in TLS_ORIGIN_CERT, multi-line or with \\n escapes", async () => {
+		const dir = await build({ precompress: false });
+		const { pem } = originPem(dir);
+		for (const value of [pem, pem.replaceAll("\n", "\\n")]) {
+			const url = await start(dir, { TLS_ORIGIN_CERT: value });
+			expect(url.startsWith("https://")).toBe(true);
+			const response = await fetch(`${url}/doc`, {
+				tls: { rejectUnauthorized: false },
+			});
+			expect(await response.text()).toBe("HTML cached v0");
+		}
 	});
 
-	test("refuses to start with only one of the TLS paths, or an unreadable one", async () => {
+	test("refuses to start when TLS_ORIGIN_CERT has no private key", async () => {
 		const dir = await build({ precompress: false });
-		for (const env of [
-			{ TLS_SERVER_CERT: join(dir, "cert.pem") },
-			{
-				TLS_SERVER_CERT: join(dir, "missing.pem"),
-				TLS_SERVER_KEY: join(dir, "missing.pem"),
+		const proc = Bun.spawn({
+			cmd: [process.execPath, join(dir, "index.js")],
+			env: {
+				...process.env,
+				PORT: "0",
+				HOST: "127.0.0.1",
+				TLS_ORIGIN_CERT: originPem(dir).cert,
 			},
-		]) {
-			const proc = Bun.spawn({
-				cmd: [process.execPath, join(dir, "index.js")],
-				env: { ...process.env, PORT: "0", HOST: "127.0.0.1", ...env },
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			expect(await proc.exited).not.toBe(0);
-			expect(await new Response(proc.stderr).text()).toContain("TLS_SERVER_");
-		}
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(await proc.exited).not.toBe(0);
+		expect(await new Response(proc.stderr).text()).toContain(
+			"TLS_ORIGIN_CERT",
+		);
 	});
 });
 

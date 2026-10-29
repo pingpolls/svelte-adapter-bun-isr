@@ -682,7 +682,7 @@ function generateServerCode(opts: {
 	return `
 import { Server } from './server/index.js';
 import { manifest, base, isrRoutes, ssrCacheRoutes, prerenderOnlyPatterns } from './server/manifest.js';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { mkdir, open, readFile, readdir, rename, rmdir, stat, unlink, utimes } from 'node:fs/promises';
 import { join, sep } from 'node:path';
 
@@ -713,8 +713,7 @@ const PROTOCOL_HEADER = env('PROTOCOL_HEADER', undefined);
 const idleTimeoutRaw = env('IDLE_TIMEOUT', undefined);
 const IDLE_TIMEOUT = idleTimeoutRaw === undefined ? DEFAULT_IDLE_TIMEOUT : Number(idleTimeoutRaw);
 const SHUTDOWN_TIMEOUT = Number(env('SHUTDOWN_TIMEOUT', 10));
-const TLS_SERVER_CERT = env('TLS_SERVER_CERT', undefined);
-const TLS_SERVER_KEY = env('TLS_SERVER_KEY', undefined);
+const TLS_ORIGIN_CERT = env('TLS_ORIGIN_CERT', undefined);
 
 /** Non-negative integer env var; anything else falls back. */
 function intEnv(name, fallback) {
@@ -739,26 +738,21 @@ runtime.worker = {
 };
 
 /**
- * PEM files are read once, synchronously, with a read-only open: a 0400 file
- * owned by the user running Bun works. Rotation needs a restart.
+ * TLS_ORIGIN_CERT holds the PEM itself, not a path: the certificate and its
+ * private key in one value (e.g. a Cloudflare Origin Certificate with its key
+ * appended). Literal \\n escapes are accepted for single-line secret stores.
+ * The variable is removed from the environment before SvelteKit starts, so
+ * $env/dynamic/private and app code never see the key.
  */
-function readTlsFile(name, path) {
-  try {
-    return readFileSync(path, 'utf8');
-  } catch (err) {
-    const hint = err.code === 'EACCES' || err.code === 'EPERM'
-      ? \` (the file must be readable by uid \${process.getuid?.()} — mode 0400 works when this user owns it)\`
-      : '';
-    throw new Error(\`[\${ADAPTER_NAME}] cannot read \${ENV_PREFIX}\${name} at \${path}: \${err.code ?? err.message}\${hint}\`);
-  }
-}
 let tls;
-if (ROLE === 'http' && (TLS_SERVER_CERT || TLS_SERVER_KEY)) {
-  if (!TLS_SERVER_CERT || !TLS_SERVER_KEY) {
-    throw new Error(\`[\${ADAPTER_NAME}] set both \${ENV_PREFIX}TLS_SERVER_CERT and \${ENV_PREFIX}TLS_SERVER_KEY, or neither\`);
+if (ROLE === 'http' && TLS_ORIGIN_CERT) {
+  const pem = TLS_ORIGIN_CERT.replace(/\\\\n/g, '\\n');
+  if (!pem.includes('-----BEGIN CERTIFICATE-----') || !/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(pem)) {
+    throw new Error(\`[\${ADAPTER_NAME}] \${ENV_PREFIX}TLS_ORIGIN_CERT must contain both the certificate and its private key as PEM blocks\`);
   }
-  tls = { cert: readTlsFile('TLS_SERVER_CERT', TLS_SERVER_CERT), key: readTlsFile('TLS_SERVER_KEY', TLS_SERVER_KEY) };
+  tls = { cert: pem, key: pem };
 }
+delete Bun.env[ENV_PREFIX + 'TLS_ORIGIN_CERT'];
 
 const server = new Server(manifest);
 await server.init({
