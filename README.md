@@ -66,7 +66,7 @@ Runtime compression prefers zstd, then gzip (brotli at its default quality costs
 
 ### Runtime environment
 
-All names take `envPrefix` if configured.
+All names take `envPrefix` if configured. An empty, blank or quoted-empty value (`""` or `''`, a common placeholder in secret stores that cannot hold an empty value) is the same as unset.
 
 | Variable | Default | Does |
 |---|---|---|

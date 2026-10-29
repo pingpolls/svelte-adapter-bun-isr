@@ -703,10 +703,14 @@ const ISR_ORIGIN = ${JSON.stringify(opts.isrOrigin)};
 const ASSET_DIR = join(import.meta.dir, 'client', base);
 const PRERENDERED_DIR = join(import.meta.dir, 'prerendered');
 
-/** Read a runtime env var under ENV_PREFIX, falling back to a default. */
+/**
+ * Read a runtime env var under ENV_PREFIX, falling back to a default. Empty,
+ * blank and quoted-empty ("" or '') values count as unset: secret stores that
+ * cannot hold an empty value often keep "" as a placeholder.
+ */
 function env(name, fallback) {
-  const value = Bun.env[ENV_PREFIX + name];
-  return value === undefined ? fallback : value;
+  const value = Bun.env[ENV_PREFIX + name]?.trim();
+  return value === undefined || value === '' || value === '""' || value === "''" ? fallback : value;
 }
 
 const HOST = env('HOST', '0.0.0.0');
@@ -1663,9 +1667,10 @@ import { join } from 'node:path';
 const ADAPTER_NAME = 'svelte-adapter-bun-isr';
 const ENV_PREFIX = ${JSON.stringify(envPrefix)};
 
+/** Same as the server's: empty, blank and quoted-empty values count as unset. */
 function env(name, fallback) {
-  const value = Bun.env[ENV_PREFIX + name];
-  return value === undefined ? fallback : value;
+  const value = Bun.env[ENV_PREFIX + name]?.trim();
+  return value === undefined || value === '' || value === '""' || value === "''" ? fallback : value;
 }
 
 const cpusFromEnv = Number(env('CPUS', 0));

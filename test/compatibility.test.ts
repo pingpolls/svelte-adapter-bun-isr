@@ -734,6 +734,15 @@ describe("TLS", () => {
 		}
 	});
 
+	test("an empty, blank or quoted-empty TLS_ORIGIN_CERT serves plain HTTP", async () => {
+		const dir = await build({ precompress: false });
+		for (const value of ["", "  ", '""', "''", ' "" ']) {
+			const url = await start(dir, { TLS_ORIGIN_CERT: value });
+			expect(url.startsWith("http://")).toBe(true);
+			expect(await (await fetch(`${url}/doc`)).text()).toBe("HTML cached v0");
+		}
+	});
+
 	test("refuses to start when TLS_ORIGIN_CERT has no private key", async () => {
 		const dir = await build({ precompress: false });
 		const proc = Bun.spawn({
