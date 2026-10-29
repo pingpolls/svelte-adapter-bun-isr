@@ -10,7 +10,11 @@ interface AdapterOptions {
 	out?: string;
 	/** Serve client + prerendered assets from Bun (incl. range requests). Default: true */
 	serveAssets?: boolean;
-	/** Emit gzip + brotli (+ zstd if available) variants at build time. Default: true */
+	/**
+	 * Emit gzip + brotli (+ zstd if available) variants at build time, served per
+	 * Accept-Encoding. Off by default: a CDN or reverse proxy in front normally
+	 * compresses. Default: false
+	 */
 	precompress?: boolean;
 	/** Prefix applied to runtime env vars (HOST, PORT, ...). Default: '' */
 	envPrefix?: string;
@@ -369,7 +373,7 @@ export default function (options: AdapterOptions = {}): Adapter {
 	const {
 		out = "build",
 		serveAssets = true,
-		precompress = true,
+		precompress = false,
 		envPrefix = "",
 		idleTimeout = 10,
 		websockets = true,
@@ -884,7 +888,9 @@ async function indexClientFiles() {
     const encodings = [['br', '.br'], ['zstd', '.zst'], ['gzip', '.gz']]
       .filter(([, ext]) => names.has(abs + ext))
       .map(([encoding, ext]) => [encoding, Bun.file(abs + ext)]);
-    clientFiles.set(relative, { file: Bun.file(abs), encodings, immutable: relative.startsWith('/_app/immutable/') });
+    const file = Bun.file(abs);
+    // A compressed variant is served with the original file's type, not the .br/.gz/.zst one.
+    clientFiles.set(relative, { file, type: file.type, encodings, immutable: relative.startsWith('/_app/immutable/') });
   }
 }
 await indexClientFiles();
@@ -1518,6 +1524,7 @@ const bunServer = ROLE === 'background' ? null : Bun.serve({
           for (const [encoding, file] of asset.encodings) {
             if (!accepts.includes(encoding)) continue;
             headers['content-encoding'] = encoding;
+            headers['content-type'] = asset.type;
             return cachedResponse(file, { headers });
           }
         }

@@ -8,7 +8,7 @@ A production-ready [SvelteKit](https://kit.svelte.dev) adapter for [Bun](https:/
 - **Bun-native server output** — no Node.js required at runtime
 - **ISR** for any prerendered route, page or endpoint (`.html`, `.json`, `.csv`, whatever it renders) — static-file speed with background revalidation, no rebuild needed
 - **Multi-core clustering** via Bun's native `reusePort` — scales across every CPU core out of the box
-- **Static asset + prerendered page serving** straight from Bun, with optional `.gz`/`.br`/`.zst` precompression
+- **Static asset + prerendered page serving** straight from Bun, with optional `.gz`/`.br`/`.zst` precompression (off by default)
 - **WebSocket support** via `hooks.server`'s `websocket` export
 - **Native TLS** from a single `TLS_ORIGIN_CERT` secret (e.g. a Cloudflare Origin Certificate)
 - **Bun-level interceptors and cluster-wide singletons** — gate requests (honeypots, rate limits) before SvelteKit runs, and start queue workers once per cluster instead of once per core
@@ -46,7 +46,7 @@ bun run build/index.js
 |---|---|---|
 | `out` | `'build'` | Output directory |
 | `serveAssets` | `true` | Serve client assets + prerendered pages from Bun. Set `false` if a CDN/proxy does this instead |
-| `precompress` | `true` | Emit `.gz`/`.br`/`.zst` variants at build time, negotiated via `Accept-Encoding` |
+| `precompress` | `false` | Emit `.gz`/`.br`/`.zst` variants at build time, negotiated via `Accept-Encoding` |
 | `envPrefix` | `''` | Prefix for runtime env vars (see [Runtime environment](#runtime-environment)) |
 | `idleTimeout` | `10` | Default `Bun.serve` idle timeout in seconds (runtime env wins if set) |
 | `compress` | `false` | Compress dynamic (SSR) responses at runtime with zstd, then gzip, per `Accept-Encoding`. Leave off when a CDN/proxy (Cloudflare, nginx) already compresses. See [Compression](#compression) |
@@ -59,7 +59,7 @@ bun run build/index.js
 
 Two independent switches:
 
-- `precompress` (build time, default on): `.br`/`.zst`/`.gz` variants of client assets and prerendered pages, picked per request with brotli > zstd > gzip. Costs no CPU at runtime.
+- `precompress` (build time, default **off**): `.br`/`.zst`/`.gz` variants of client assets and prerendered pages, picked per request with brotli > zstd > gzip, each served with the original file's `Content-Type`. Costs no CPU at runtime. Leave it off when a CDN or reverse proxy in front compresses.
 - `compress` (runtime, default **off**): compresses dynamic SSR responses on the fly. Turn it on only when nothing in front of Bun compresses (a CDN or reverse proxy normally does, and compressing twice just wastes CPU).
 
 Runtime compression prefers zstd, then gzip (brotli at its default quality costs roughly 10x the CPU per response, so it stays build-time only), honors `q=0`, and streams the body instead of buffering it. It is skipped for non-200 responses, bodies already encoded, `Cache-Control: no-transform`, bodies under 1 KB when `Content-Length` is set, `text/event-stream`, and any response without an explicit compressible `Content-Type` (`text/*`, JSON, JavaScript, XML/SVG). It adds `Vary: Accept-Encoding` and weakens strong `ETag`s.

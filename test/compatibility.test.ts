@@ -76,6 +76,7 @@ async function build(options: Parameters<typeof adapter>[0] = {}) {
 		writeClient: (dest: string) => {
 			mkdirSync(dest, { recursive: true });
 			writeFileSync(join(dest, "asset.txt"), "static asset");
+			writeFileSync(join(dest, "app.js"), "export const asset = 1;");
 		},
 		writePrerendered() {},
 		writeServer() {},
@@ -230,6 +231,7 @@ describe("generated runtime compatibility", () => {
 	let second: string;
 	beforeAll(async () => {
 		dir = await build({
+			precompress: true,
 			isrHosts: ["CANONICAL.example"],
 			isrOrigin: "https://canonical.example:8443",
 		});
@@ -462,6 +464,46 @@ describe("generated runtime compatibility", () => {
 		);
 		expect(result.failed).toHaveLength(4);
 	});
+});
+
+test("precompression is off by default", async () => {
+	const dir = await build();
+	for (const ext of [".br", ".gz", ".zst"]) {
+		expect(await Bun.file(join(dir, "client/app.js" + ext)).exists()).toBe(
+			false,
+		);
+		expect(
+			await Bun.file(join(dir, "prerendered/doc.html" + ext)).exists(),
+		).toBe(false);
+	}
+	const url = await start(dir);
+	const response = await fetch(`${url}/app.js`, {
+		headers: { "accept-encoding": "br, gzip, zstd" },
+	});
+	expect(response.headers.get("content-encoding")).toBeNull();
+	expect(response.headers.get("content-type")).toStartWith("text/javascript");
+});
+
+test("a precompressed client asset keeps its own content type", async () => {
+	const url = await start(await build({ precompress: true }));
+	for (const [encoding, expected] of [
+		["br", "br"],
+		["zstd", "zstd"],
+		["gzip", "gzip"],
+	]) {
+		for (const [path, type] of [
+			["/app.js", "text/javascript"],
+			["/asset.txt", "text/plain"],
+		]) {
+			const response = await fetch(`${url}${path}`, {
+				headers: { "accept-encoding": encoding },
+			});
+			expect(response.headers.get("content-encoding")).toBe(expected);
+			// Not application/octet-stream or application/gzip from the variant's
+			// extension: browsers refuse a module script with those.
+			expect(response.headers.get("content-type")).toStartWith(type);
+		}
+	}
 });
 
 test("omitted options preserve all-host interception and the old regeneration origin", async () => {
@@ -706,9 +748,7 @@ describe("TLS", () => {
 			stderr: "pipe",
 		});
 		expect(await proc.exited).not.toBe(0);
-		expect(await new Response(proc.stderr).text()).toContain(
-			"TLS_ORIGIN_CERT",
-		);
+		expect(await new Response(proc.stderr).text()).toContain("TLS_ORIGIN_CERT");
 	});
 });
 
