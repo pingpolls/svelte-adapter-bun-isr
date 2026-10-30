@@ -1121,7 +1121,7 @@ async function expandEntries(routeId) {
   if (nodeIndex === undefined) return null;
   const node = await manifest.nodes[nodeIndex]();
   const entriesFn = node?.server?.entries ?? node?.universal?.entries;
-  if (typeof entriesFn !== 'function') return [];
+  if (typeof entriesFn !== 'function') return null;
   const paramSets = (await entriesFn()) || [];
   return paramSets.map((params) =>
     base + routePath(routeId).replace(/\\[\\[?(\\.\\.\\.)?([^\\]=]+)(?:=[^\\]]+)?\\]\\]?/g, (_m, rest, name) => rest ? String(params[name] ?? '').split('/').map(encodeURIComponent).join('/') : encodeURIComponent(String(params[name] ?? ''))).replace(/\\/+/g, '/'),
@@ -1160,10 +1160,9 @@ async function regenerateImpl(paths, removePaths) {
         if (!result.failed.some((failure) => failure.path === entry)) result.failed.push({ path: entry, reason: 'no +page node with entries for this route id' });
         continue;
       }
-      if (concretePaths.length === 0) {
-        result.failed.push({ path: entry, reason: 'no +page node with entries for this route id' });
-        continue;
-      }
+      // entries() listing no pages (say, no guide published yet) leaves
+      // nothing to render: not a failure.
+      if (concretePaths.length === 0) continue;
       await Promise.all(concretePaths.map((p) => regenerateOne(p, result)));
       continue;
     }

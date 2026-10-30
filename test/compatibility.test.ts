@@ -69,6 +69,8 @@ async function build(options: Parameters<typeof adapter>[0] = {}) {
 			},
 			{ id: "/(public)", prerender: "auto", config: {} },
 			{ id: "/(public)/fixed", prerender: "auto", config: {} },
+			{ id: "/(public)/guides/[guide]", prerender: "auto", config: {} },
+			{ id: "/(public)/plain/[item]", prerender: "auto", config: {} },
 		],
 		log: { minor() {}, warn() {} },
 		getBuildDirectory: () => join(dir, "temp"),
@@ -87,9 +89,15 @@ async function build(options: Parameters<typeof adapter>[0] = {}) {
         routes: [
           { id: '/(public)/fixed', pattern: /^\\/fixed$/, page: { leaf: 0 } },
           { id: '/(public)', pattern: /^\\/$/, page: { leaf: 0 } },
-          { id: '/(public)/[document]', pattern: /^\\/[^/]+\\/?$/, page: { leaf: 0 } }
+          { id: '/(public)/[document]', pattern: /^\\/[^/]+\\/?$/, page: { leaf: 0 } },
+          { id: '/(public)/guides/[guide]', pattern: /^\\/guides\\/[^/]+\\/?$/, page: { leaf: 1 } },
+          { id: '/(public)/plain/[item]', pattern: /^\\/plain\\/[^/]+\\/?$/, page: { leaf: 2 } }
         ],
-        nodes: [async () => ({ server: { entries: async () => [{ document: 'fresh' }, { document: 'with space' }] } })]
+        nodes: [
+          async () => ({ server: { entries: async () => [{ document: 'fresh' }, { document: 'with space' }] } }),
+          async () => ({ server: { entries: async () => [] } }),
+          async () => ({ server: {} })
+        ]
     };`,
 			),
 	};
@@ -423,6 +431,19 @@ describe("generated runtime compatibility", () => {
 		const dotted = await request(second, "/dotted.slug");
 		expect(dotted.headers.get("content-type")).toBe("text/html");
 		expect(await dotted.text()).toContain("v3");
+	});
+
+	test("a route whose entries() lists no pages has nothing to regenerate, while a route without entries() fails", async () => {
+		const empty = await regenerate(first, ["/(public)/guides/[guide]"]);
+		expect(empty.failed).toEqual([]);
+		expect([...empty.created, ...empty.regenerated]).toEqual([]);
+		const missing = await regenerate(first, ["/(public)/plain/[item]"]);
+		expect(missing.failed).toEqual([
+			{
+				path: "/(public)/plain/[item]",
+				reason: "no +page node with entries for this route id",
+			},
+		]);
 	});
 
 	test("unpublish removes paired files and prevents stale peer or compressed responses", async () => {
