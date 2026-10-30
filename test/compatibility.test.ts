@@ -694,7 +694,7 @@ describe("sharedStore", () => {
 });
 
 describe("TLS", () => {
-	/** A self-signed certificate followed by its key, as one PEM string. */
+	/** A self-signed certificate and its key, apart and as one PEM string. */
 	function originPem(dir: string) {
 		const cert = join(dir, "cert.pem");
 		const key = join(dir, "key.pem");
@@ -717,6 +717,7 @@ describe("TLS", () => {
 		expect(openssl.exitCode).toBe(0);
 		return {
 			cert: readFileSync(cert, "utf8"),
+			key: readFileSync(key, "utf8"),
 			pem: readFileSync(cert, "utf8") + readFileSync(key, "utf8"),
 		};
 	}
@@ -734,16 +735,38 @@ describe("TLS", () => {
 		}
 	});
 
-	test("an empty, blank or quoted-empty TLS_ORIGIN_CERT serves plain HTTP", async () => {
+	test("serves HTTPS from the certificate in TLS_ORIGIN_CERT and the key in TLS_ORIGIN_KEY", async () => {
+		const dir = await build({ precompress: false });
+		const { cert, key } = originPem(dir);
+		for (const [certValue, keyValue] of [
+			[cert, key],
+			[cert.replaceAll("\n", "\\n"), key.replaceAll("\n", "\\n")],
+		]) {
+			const url = await start(dir, {
+				TLS_ORIGIN_CERT: certValue,
+				TLS_ORIGIN_KEY: keyValue,
+			});
+			expect(url.startsWith("https://")).toBe(true);
+			const response = await fetch(`${url}/doc`, {
+				tls: { rejectUnauthorized: false },
+			});
+			expect(await response.text()).toBe("HTML cached v0");
+		}
+	});
+
+	test("empty, blank or quoted-empty TLS_ORIGIN_CERT and TLS_ORIGIN_KEY serve plain HTTP", async () => {
 		const dir = await build({ precompress: false });
 		for (const value of ["", "  ", '""', "''", ' "" ']) {
-			const url = await start(dir, { TLS_ORIGIN_CERT: value });
+			const url = await start(dir, {
+				TLS_ORIGIN_CERT: value,
+				TLS_ORIGIN_KEY: value,
+			});
 			expect(url.startsWith("http://")).toBe(true);
 			expect(await (await fetch(`${url}/doc`)).text()).toBe("HTML cached v0");
 		}
 	});
 
-	test("refuses to start when TLS_ORIGIN_CERT has no private key", async () => {
+	test("refuses to start when TLS_ORIGIN_CERT has no private key and TLS_ORIGIN_KEY is unset", async () => {
 		const dir = await build({ precompress: false });
 		const proc = Bun.spawn({
 			cmd: [process.execPath, join(dir, "index.js")],
@@ -757,7 +780,26 @@ describe("TLS", () => {
 			stderr: "pipe",
 		});
 		expect(await proc.exited).not.toBe(0);
-		expect(await new Response(proc.stderr).text()).toContain("TLS_ORIGIN_CERT");
+		expect(await new Response(proc.stderr).text()).toContain("TLS_ORIGIN_KEY");
+	});
+
+	test("refuses to start when TLS_ORIGIN_KEY is set without a certificate", async () => {
+		const dir = await build({ precompress: false });
+		const proc = Bun.spawn({
+			cmd: [process.execPath, join(dir, "index.js")],
+			env: {
+				...process.env,
+				PORT: "0",
+				HOST: "127.0.0.1",
+				TLS_ORIGIN_KEY: originPem(dir).key,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(await proc.exited).not.toBe(0);
+		expect(await new Response(proc.stderr).text()).toContain(
+			"TLS_ORIGIN_CERT must contain the certificate",
+		);
 	});
 });
 

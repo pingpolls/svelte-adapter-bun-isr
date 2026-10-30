@@ -10,7 +10,7 @@ A production-ready [SvelteKit](https://kit.svelte.dev) adapter for [Bun](https:/
 - **Multi-core clustering** via Bun's native `reusePort` — scales across every CPU core out of the box
 - **Static asset + prerendered page serving** straight from Bun, with optional `.gz`/`.br`/`.zst` precompression (off by default)
 - **WebSocket support** via `hooks.server`'s `websocket` export
-- **Native TLS** from a single `TLS_ORIGIN_CERT` secret (e.g. a Cloudflare Origin Certificate)
+- **Native TLS** from `TLS_ORIGIN_CERT` and `TLS_ORIGIN_KEY` secrets (e.g. a Cloudflare Origin Certificate and its private key)
 - **Bun-level interceptors and cluster-wide singletons** — gate requests (honeypots, rate limits) before SvelteKit runs, and start queue workers once per cluster instead of once per core
 
 ## Install
@@ -74,7 +74,8 @@ All names take `envPrefix` if configured. An empty, blank or quoted-empty value 
 | `SOCKET_PATH` | unset | Listen on a unix socket instead of `HOST`/`PORT` |
 | `HOST_HEADER` / `PROTOCOL_HEADER` | unset | Trusted proxy headers (see below) |
 | `IDLE_TIMEOUT` | `idleTimeout` option | `Bun.serve` idle timeout, seconds |
-| `TLS_ORIGIN_CERT` | unset | PEM **contents** (certificate + private key in one value); set it to serve HTTPS (see [TLS](#tls)) |
+| `TLS_ORIGIN_CERT` | unset | Certificate PEM **contents**; set it with `TLS_ORIGIN_KEY` to serve HTTPS (see [TLS](#tls)) |
+| `TLS_ORIGIN_KEY` | unset | Private key PEM **contents** for `TLS_ORIGIN_CERT` (optional when `TLS_ORIGIN_CERT` holds both blocks) |
 | `CPUS` | core count | HTTP worker count (`cluster: true`) |
 | `BACKGROUND_WORKERS` | `0` | Extra non-HTTP processes for `singleton()` (see [Singletons](#singletons-queue-workers-once-per-cluster)) |
 | `WORKER_ROLE` | `http` | `background` makes a process skip `Bun.serve` and only host singletons. Set by the supervisor; set it yourself only with `cluster: false` |
@@ -249,24 +250,24 @@ Bun's pub/sub works as usual — `ws.subscribe('room')` / `ws.publish(...)`, or 
 
 ### TLS
 
-`TLS_ORIGIN_CERT` holds the PEM itself, not a file path: the certificate followed by its private key. For a Cloudflare Origin Certificate, paste the "Origin Certificate" block and then the "Private Key" block into one secret:
+`TLS_ORIGIN_CERT` and `TLS_ORIGIN_KEY` hold the PEM itself, not a file path: the certificate and its private key. For a Cloudflare Origin Certificate, put the "Origin Certificate" box in `TLS_ORIGIN_CERT` and the "Private Key" box in `TLS_ORIGIN_KEY`:
 
 ```bash
-TLS_ORIGIN_CERT="$(cat origin-cert.pem origin-key.pem)" bun build/index.js
+TLS_ORIGIN_CERT="$(cat origin-cert.pem)" TLS_ORIGIN_KEY="$(cat origin-key.pem)" bun build/index.js
 ```
 
 ```
------BEGIN CERTIFICATE-----
-...
------END CERTIFICATE-----
------BEGIN PRIVATE KEY-----
-...
------END PRIVATE KEY-----
+TLS_ORIGIN_CERT:              TLS_ORIGIN_KEY:
+-----BEGIN CERTIFICATE-----   -----BEGIN PRIVATE KEY-----
+...                           ...
+-----END CERTIFICATE-----     -----END PRIVATE KEY-----
 ```
 
-Real newlines and literal `\n` escapes both work, so single-line secret stores and `.env` files are fine. A value without both a `CERTIFICATE` and a `PRIVATE KEY` block fails startup with an error naming the variable. Cloudflare shows the private key only once when the certificate is created; if it is lost, create a new certificate.
+One `TLS_ORIGIN_CERT` holding the certificate followed by the key still works, with `TLS_ORIGIN_KEY` unset (the only form before 1.5.0).
 
-The variable is read once at startup and then deleted from the process environment before SvelteKit loads, so `$env/dynamic/private` and app code never see the key. With `cluster: true` the supervisor passes it on to each worker, which reads and deletes it the same way. Certificate rotation needs a restart. Works with `SOCKET_PATH` too.
+Real newlines and literal `\n` escapes both work, so single-line secret stores and `.env` files are fine. Empty, blank or quoted-empty (`""`) values count as unset. A certificate without a `CERTIFICATE` block, or no `PRIVATE KEY` block in `TLS_ORIGIN_KEY` (or in `TLS_ORIGIN_CERT` when the key is unset), fails startup with an error naming the variable. Cloudflare shows the private key only once when the certificate is created; if it is lost, create a new certificate.
+
+Both variables are read once at startup and then deleted from the process environment before SvelteKit loads, so `$env/dynamic/private` and app code never see the key. With `cluster: true` the supervisor passes them on to each worker, which reads and deletes them the same way. Certificate rotation needs a restart. Works with `SOCKET_PATH` too.
 
 ### Intercept requests before SvelteKit
 

@@ -722,6 +722,7 @@ const idleTimeoutRaw = env('IDLE_TIMEOUT', undefined);
 const IDLE_TIMEOUT = idleTimeoutRaw === undefined ? DEFAULT_IDLE_TIMEOUT : Number(idleTimeoutRaw);
 const SHUTDOWN_TIMEOUT = Number(env('SHUTDOWN_TIMEOUT', 10));
 const TLS_ORIGIN_CERT = env('TLS_ORIGIN_CERT', undefined);
+const TLS_ORIGIN_KEY = env('TLS_ORIGIN_KEY', undefined);
 
 /** Non-negative integer env var; anything else falls back. */
 function intEnv(name, fallback) {
@@ -746,21 +747,27 @@ runtime.worker = {
 };
 
 /**
- * TLS_ORIGIN_CERT holds the PEM itself, not a path: the certificate and its
- * private key in one value (e.g. a Cloudflare Origin Certificate with its key
- * appended). Literal \\n escapes are accepted for single-line secret stores.
- * The variable is removed from the environment before SvelteKit starts, so
- * $env/dynamic/private and app code never see the key.
+ * TLS_ORIGIN_CERT and TLS_ORIGIN_KEY hold the PEM itself, not a path: the
+ * certificate (e.g. a Cloudflare Origin Certificate) and its private key, as
+ * separate values. One TLS_ORIGIN_CERT holding both blocks also works, with
+ * TLS_ORIGIN_KEY unset. Literal \\n escapes are accepted for single-line
+ * secret stores. Both variables are removed from the environment before
+ * SvelteKit starts, so $env/dynamic/private and app code never see the key.
  */
 let tls;
-if (ROLE === 'http' && TLS_ORIGIN_CERT) {
-  const pem = TLS_ORIGIN_CERT.replace(/\\\\n/g, '\\n');
-  if (!pem.includes('-----BEGIN CERTIFICATE-----') || !/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(pem)) {
-    throw new Error(\`[\${ADAPTER_NAME}] \${ENV_PREFIX}TLS_ORIGIN_CERT must contain both the certificate and its private key as PEM blocks\`);
+if (ROLE === 'http' && (TLS_ORIGIN_CERT || TLS_ORIGIN_KEY)) {
+  const certPem = (TLS_ORIGIN_CERT ?? '').replace(/\\\\n/g, '\\n');
+  const keyPem = (TLS_ORIGIN_KEY ?? certPem).replace(/\\\\n/g, '\\n');
+  if (!certPem.includes('-----BEGIN CERTIFICATE-----')) {
+    throw new Error(\`[\${ADAPTER_NAME}] \${ENV_PREFIX}TLS_ORIGIN_CERT must contain the certificate as a PEM block\`);
   }
-  tls = { cert: pem, key: pem };
+  if (!/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(keyPem)) {
+    throw new Error(\`[\${ADAPTER_NAME}] \${ENV_PREFIX}TLS_ORIGIN_KEY must contain the private key as a PEM block (or TLS_ORIGIN_CERT must include it)\`);
+  }
+  tls = { cert: certPem, key: keyPem };
 }
 delete Bun.env[ENV_PREFIX + 'TLS_ORIGIN_CERT'];
+delete Bun.env[ENV_PREFIX + 'TLS_ORIGIN_KEY'];
 
 const server = new Server(manifest);
 await server.init({
