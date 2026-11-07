@@ -73,6 +73,7 @@ All names take `envPrefix` if configured. An empty, blank or quoted-empty value 
 | `HOST` / `PORT` | `0.0.0.0` / `3000` | Listen address |
 | `SOCKET_PATH` | unset | Listen on a unix socket instead of `HOST`/`PORT` |
 | `HOST_HEADER` / `PROTOCOL_HEADER` | unset | Trusted proxy headers (see below) |
+| `ADDRESS_HEADER` / `XFF_DEPTH` | unset / `1` | Trusted header for `getClientAddress()` (see below) |
 | `IDLE_TIMEOUT` | `idleTimeout` option | `Bun.serve` idle timeout, seconds |
 | `TLS_ORIGIN_CERT` | unset | Certificate PEM **contents**; set it with `TLS_ORIGIN_KEY` to serve HTTPS (see [TLS](#tls)) |
 | `TLS_ORIGIN_KEY` | unset | Private key PEM **contents** for `TLS_ORIGIN_CERT` (optional when `TLS_ORIGIN_CERT` holds both blocks) |
@@ -97,6 +98,8 @@ adapter({
 Only allowlisted hostnames can serve prerendered publications or receive the adapter's unknown-ISR 404. Other hosts go through `server.respond()` so SvelteKit hooks and rerouting can resolve custom-domain forms at the same paths, including `/`. Shared client assets remain available on every host. Only `GET` and `HEAD` are intercepted; actions and other methods always reach SvelteKit. `HEAD` has the same cache status/headers as `GET`, with no body.
 
 Behind a trusted reverse proxy, set `HOST_HEADER=x-forwarded-host` and `PROTOCOL_HEADER=x-forwarded-proto` (with `envPrefix` if configured). The adapter uses these explicitly configured headers for both hostname gating and SvelteKit's request URL. Without configuration, forwarded headers are ignored. Missing headers fall back to the incoming URL; malformed or multi-value configured headers return HTTP 400. Configure the proxy to overwrite these headers with a single authority (`hostname[:port]`) and `http` or `https`. Use an `isrOrigin` on the canonical host so regeneration runs the canonical application hooks.
+
+`getClientAddress()` returns the socket peer (`server.requestIP()`, empty on a unix socket) unless `ADDRESS_HEADER` names a header your proxy sets, such as `cf-connecting-ip` or `x-forwarded-for`. Forwarded headers are never read otherwise, because a client can send any value in them. With `ADDRESS_HEADER=x-forwarded-for`, set `XFF_DEPTH` to the number of trusted proxies in front of the server: the address that many entries from the right is returned, so addresses a client prepends are ignored.
 
 ## Features by example
 

@@ -28,8 +28,11 @@ export class Server {
     const hooks = join(import.meta.dir, '../hooks-test.js');
     if (await Bun.file(hooks).exists()) await import(hooks);
   }
-  async respond(request) {
+  async respond(request, options) {
     const url = new URL(request.url);
+    if (url.pathname === '/client-address') {
+      return new Response(options.getClientAddress(), { headers: { 'content-type': 'text/plain' } });
+    }
     if (url.pathname === '/api/regenerate') {
       const { paths = [], removePaths = [] } = await request.json();
       return Response.json(await globalThis[registry].regenerate(paths, removePaths));
@@ -230,6 +233,61 @@ describe("ISR option validation", () => {
 				isrOrigin: "https://canonical.example:8443/",
 			}),
 		).not.toThrow();
+	});
+});
+
+describe("client address", () => {
+	let dir: string;
+	beforeAll(async () => {
+		dir = await build({ isrHosts: ["CANONICAL.example"] });
+	});
+
+	async function address(url: string, headers: Record<string, string>) {
+		const response = await fetch(`${url}/client-address`, { headers });
+		expect(response.status).toBe(200);
+		return response.text();
+	}
+
+	test("forwarded headers are ignored unless ADDRESS_HEADER names one", async () => {
+		const url = await start(dir);
+		expect(
+			await address(url, {
+				"x-forwarded-for": "203.0.113.9",
+				"cf-connecting-ip": "203.0.113.9",
+			}),
+		).toBe("127.0.0.1");
+	});
+
+	test("ADDRESS_HEADER reads the named header and falls back to the peer", async () => {
+		const url = await start(dir, { ADDRESS_HEADER: "CF-Connecting-IP" });
+		expect(
+			await address(url, {
+				"cf-connecting-ip": "198.51.100.7",
+				"x-forwarded-for": "203.0.113.9",
+			}),
+		).toBe("198.51.100.7");
+		expect(await address(url, {})).toBe("127.0.0.1");
+	});
+
+	test("x-forwarded-for is read XFF_DEPTH entries from the right", async () => {
+		const one = await start(dir, { ADDRESS_HEADER: "x-forwarded-for" });
+		expect(
+			await address(one, {
+				"x-forwarded-for": "203.0.113.9, 198.51.100.7",
+			}),
+		).toBe("198.51.100.7");
+
+		const two = await start(dir, {
+			ADDRESS_HEADER: "x-forwarded-for",
+			XFF_DEPTH: "2",
+		});
+		const forwarded = "203.0.113.9, 198.51.100.7, 192.0.2.1";
+		expect(await address(two, { "x-forwarded-for": forwarded })).toBe(
+			"198.51.100.7",
+		);
+		expect(await address(two, { "x-forwarded-for": "192.0.2.1" })).toBe(
+			"192.0.2.1",
+		);
 	});
 });
 

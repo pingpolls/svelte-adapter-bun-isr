@@ -718,6 +718,7 @@ const PORT = Number(env('PORT', 3000));
 const SOCKET_PATH = env('SOCKET_PATH', undefined);
 const HOST_HEADER = env('HOST_HEADER', undefined);
 const PROTOCOL_HEADER = env('PROTOCOL_HEADER', undefined);
+const ADDRESS_HEADER = env('ADDRESS_HEADER', '').toLowerCase();
 const idleTimeoutRaw = env('IDLE_TIMEOUT', undefined);
 const IDLE_TIMEOUT = idleTimeoutRaw === undefined ? DEFAULT_IDLE_TIMEOUT : Number(idleTimeoutRaw);
 const SHUTDOWN_TIMEOUT = Number(env('SHUTDOWN_TIMEOUT', 10));
@@ -728,6 +729,27 @@ const TLS_ORIGIN_KEY = env('TLS_ORIGIN_KEY', undefined);
 function intEnv(name, fallback) {
   const value = Number(env(name, fallback));
   return Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
+const XFF_DEPTH = Math.max(intEnv('XFF_DEPTH', 1), 1);
+
+/**
+ * The address SvelteKit's getClientAddress() returns. A forwarded header is
+ * whatever the client sent unless a trusted proxy overwrites it, so one is read
+ * only when ADDRESS_HEADER names it; otherwise the socket peer is the answer.
+ * For x-forwarded-for, XFF_DEPTH is the number of trusted proxies in front of
+ * this server: the entry that many places from the right is the visitor.
+ */
+function clientAddress(request) {
+  if (ADDRESS_HEADER) {
+    const value = request.headers.get(ADDRESS_HEADER)?.trim();
+    if (value) {
+      if (ADDRESS_HEADER !== 'x-forwarded-for') return value;
+      const addresses = value.split(',').map((address) => address.trim()).filter(Boolean);
+      if (addresses.length > 0) return addresses[Math.max(addresses.length - XFF_DEPTH, 0)];
+    }
+  }
+  return bunServer?.requestIP(request)?.address ?? '';
 }
 
 /**
@@ -1611,7 +1633,7 @@ const bunServer = ROLE === 'background' ? null : Bun.serve({
       platform: { server: bunServer, request: reads ? trackRequest(request, reads) : request },
       getClientAddress: () => {
         if (reads) reads.addr = true;
-        return request.headers.get('x-forwarded-for') ?? '127.0.0.1';
+        return clientAddress(request);
       },
     });
     const cacheRule = route !== undefined && request.method === 'GET' ? ssrCacheRoutes[route.id] : undefined;
