@@ -34,6 +34,13 @@ interface AdapterOptions {
 	isrHosts?: string[];
 	/** HTTP(S) origin used for ISR renders and the fallback 404. Default: 'http://isr-worker' */
 	isrOrigin?: string;
+	/**
+	 * Extra response headers for prerendered/ISR pages and the adapter's own 404, which are
+	 * served from disk without running SvelteKit's `handle` (security headers, Cache-Control).
+	 * Not applied to client assets or SSR responses. `content-type`, `content-encoding`,
+	 * `content-length` and `vary` are set by the adapter and can't be overridden. Default: {}
+	 */
+	prerenderedHeaders?: Record<string, string>;
 }
 
 /** Options for `config.ssrCache` when more than a bare TTL is needed. */
@@ -381,8 +388,10 @@ export default function (options: AdapterOptions = {}): Adapter {
 		compress = false,
 		isrHosts,
 		isrOrigin = "http://isr-worker",
+		prerenderedHeaders = {},
 	} = options;
 	const normalizedHosts = validateIsrOptions(isrHosts, isrOrigin);
+	const extraHeaders = validatePrerenderedHeaders(prerenderedHeaders);
 
 	return {
 		name: ADAPTER_NAME,
@@ -519,6 +528,7 @@ export default function (options: AdapterOptions = {}): Adapter {
 					compress,
 					isrHosts: normalizedHosts,
 					isrOrigin: new URL(isrOrigin).origin,
+					prerenderedHeaders: extraHeaders,
 				}),
 			);
 			if (cluster) {
@@ -575,6 +585,31 @@ function validateIsrOptions(
 		);
 	}
 	return hosts?.map((host) => host.toLowerCase());
+}
+
+const RESERVED_PRERENDERED_HEADERS = new Set([
+	"content-type",
+	"content-encoding",
+	"content-length",
+	"vary",
+]);
+
+/** Lowercases header names and rejects invalid or adapter-owned ones. */
+function validatePrerenderedHeaders(
+	headers: Record<string, string>,
+): Record<string, string> {
+	if (headers === null || typeof headers !== "object" || Array.isArray(headers))
+		throw new Error(`[${ADAPTER_NAME}] prerenderedHeaders must be an object`);
+	const result: Record<string, string> = {};
+	for (const [name, value] of Object.entries(headers)) {
+		const key = name.toLowerCase();
+		if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(key) || typeof value !== "string" || /[\r\n\0]/.test(value))
+			throw new Error(`[${ADAPTER_NAME}] prerenderedHeaders has an invalid header: ${name}`);
+		if (RESERVED_PRERENDERED_HEADERS.has(key))
+			throw new Error(`[${ADAPTER_NAME}] prerenderedHeaders cannot set ${key}; the adapter sets it`);
+		result[key] = value;
+	}
+	return result;
 }
 
 /** Recursively copy a directory; siblings copy in parallel. */
@@ -680,6 +715,7 @@ function generateServerCode(opts: {
 	compress: boolean;
 	isrHosts: string[] | undefined;
 	isrOrigin: string;
+	prerenderedHeaders: Record<string, string>;
 }): string {
 	const { serveAssets, envPrefix, idleTimeout, websocketModule } = opts;
 
@@ -700,6 +736,7 @@ const SERVE_ASSETS = ${JSON.stringify(serveAssets)};
 const COMPRESS = ${JSON.stringify(opts.compress)};
 const ISR_HOSTS = ${JSON.stringify(opts.isrHosts ?? null)};
 const ISR_ORIGIN = ${JSON.stringify(opts.isrOrigin)};
+const PRERENDERED_HEADERS = ${JSON.stringify(opts.prerenderedHeaders)};
 const ASSET_DIR = join(import.meta.dir, 'client', base);
 const PRERENDERED_DIR = join(import.meta.dir, 'prerendered');
 
@@ -1264,7 +1301,7 @@ function loadNotFound() {
     }
   })());
 }
-const NOT_FOUND_HEADERS = { 'content-type': 'text/html; charset=utf-8' };
+const NOT_FOUND_HEADERS = { ...PRERENDERED_HEADERS, 'content-type': 'text/html; charset=utf-8' };
 
 async function notFound(method) {
   const body = await loadNotFound();
@@ -1587,7 +1624,7 @@ const bunServer = ROLE === 'background' ? null : Bun.serve({
         }
 
         const freshFile = Bun.file(filePath);
-        const headers = { 'content-type': type || 'text/html; charset=utf-8', vary: 'Accept-Encoding' };
+        const headers = { ...PRERENDERED_HEADERS, 'content-type': type || 'text/html; charset=utf-8', vary: 'Accept-Encoding' };
 
         // Encoding choice is memoized per entry; it resets whenever the entry is replaced.
         const encodingKey = acceptEncoding ?? '';

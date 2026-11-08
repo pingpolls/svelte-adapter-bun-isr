@@ -9,6 +9,8 @@ export default defineConfig({
 		sveltekit({
 			adapter: BunISRAdapter({
 				precompress: false,
+				// Served on prerendered/ISR pages and the adapter's 404, which skip `handle`.
+				prerenderedHeaders: { "X-Frame-Options": "DENY" },
 			}),
 			// /no-isr/[slug] has no entries on an empty DB; that is the point of the fixture.
 			prerender: { handleUnseenRoutes: "ignore" },

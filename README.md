@@ -54,6 +54,7 @@ bun run build/index.js
 | `cluster` | `true` | Spawn one worker per CPU core behind `SO_REUSEPORT`. Set `false` if something else already manages process count (PM2, k8s HPA, fly.io) — running both multiplies your worker count |
 | `isrHosts` | omitted | Exact, case-insensitive DNS hostname allowlist for **all** prerendered files and unknown-ISR interception. Omitted allows every host (backward compatible); `[]` disables both interceptions. No schemes, ports, wildcards, or paths; request ports are ignored |
 | `isrOrigin` | `'http://isr-worker'` | HTTP(S) origin used by HTML/data regeneration and fallback-404 rendering. An optional trailing `/` is accepted; credentials, other paths, queries, and fragments are rejected at build time |
+| `prerenderedHeaders` | `{}` | Extra response headers (for example HSTS, CSP, `Cache-Control`) on prerendered/ISR pages and the adapter's own 404. Those are served from disk without running SvelteKit's `handle`, so headers set there never reach them. Client assets and SSR responses are untouched; `content-type`, `content-encoding`, `content-length` and `vary` stay the adapter's |
 
 ### Compression
 
