@@ -245,11 +245,14 @@ export function sharedStore(name = "default"): SharedStore {
 	// Under saturated multi-process writes the automatic checkpoint never gets a quiet
 	// moment, so the WAL grows without bound (GBs in RAM-backed /dev/shm within a minute).
 	// RESTART briefly blocks writers until the WAL is fully checkpointed, then reuses it.
-	setInterval(() => {
-		try {
-			db.run("PRAGMA wal_checkpoint(RESTART)");
-		} catch {}
-	}, 100 + Math.random() * 25).unref();
+	setInterval(
+		() => {
+			try {
+				db.run("PRAGMA wal_checkpoint(RESTART)");
+			} catch {}
+		},
+		100 + Math.random() * 25,
+	).unref();
 	stores.set(name, store);
 	return store;
 }
@@ -603,10 +606,18 @@ function validatePrerenderedHeaders(
 	const result: Record<string, string> = {};
 	for (const [name, value] of Object.entries(headers)) {
 		const key = name.toLowerCase();
-		if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(key) || typeof value !== "string" || /[\r\n\0]/.test(value))
-			throw new Error(`[${ADAPTER_NAME}] prerenderedHeaders has an invalid header: ${name}`);
+		if (
+			!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(key) ||
+			typeof value !== "string" ||
+			/[\r\n\0]/.test(value)
+		)
+			throw new Error(
+				`[${ADAPTER_NAME}] prerenderedHeaders has an invalid header: ${name}`,
+			);
 		if (RESERVED_PRERENDERED_HEADERS.has(key))
-			throw new Error(`[${ADAPTER_NAME}] prerenderedHeaders cannot set ${key}; the adapter sets it`);
+			throw new Error(
+				`[${ADAPTER_NAME}] prerenderedHeaders cannot set ${key}; the adapter sets it`,
+			);
 		result[key] = value;
 	}
 	return result;
