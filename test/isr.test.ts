@@ -412,6 +412,23 @@ describe("SSR, static and ISR slug behavior", () => {
 		expect((await fetch(`${baseUrl}/no-isr/brand-new-todo`)).status).toBe(404);
 	});
 
+	test("prerenderedHeaders reach prerendered pages and the adapter 404, not SSR or assets", async () => {
+		const isr = await fetch(`${baseUrl}/isr/page`);
+		expect(isr.status).toBe(200);
+		expect(isr.headers.get("x-frame-options")).toBe("DENY");
+		expect(isr.headers.get("content-type")).toContain("text/html");
+		await isr.text();
+
+		const missing = await fetch(`${baseUrl}/no-isr/nope-headers`);
+		expect(missing.status).toBe(404);
+		expect(missing.headers.get("x-frame-options")).toBe("DENY");
+		await missing.text();
+
+		const ssr = await fetch(`${baseUrl}/ssr/page`);
+		expect(ssr.headers.get("x-frame-options")).toBeNull();
+		await ssr.text();
+	});
+
 	test("404 for missing prerendered slugs is served without regeneration or SSR", async () => {
 		const started = performance.now();
 		for (let i = 0; i < 200; i++) {
